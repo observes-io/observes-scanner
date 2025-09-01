@@ -1,0 +1,38 @@
+trigger: none
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+
+jobs:
+- job: observesScan
+  timeoutInMinutes: 360
+  steps:
+  - task: UsePythonVersion@0
+    inputs:
+      versionSpec: '3.x'
+      addToPath: true
+  - task: CmdLine@2
+    displayName: 'Set up Python environment'
+    inputs:
+      script: |
+        git clone https://github.com/observes-io/observes-scanner.git
+        cd observes-scanner
+        python -m venv .venv
+        source .venv/bin/activate
+        pip install --upgrade pip
+        pip install -r requirements.txt || true
+  - task: CmdLine@2
+    displayName: 'Run Azure DevOps Scanner'
+    inputs:
+      script: |
+        source .venv/bin/activate
+        python scan.py --organization <YourOrganization> --job-id $(Build.BuildId) --pat-token <YourPATToken> --results-dir $(Build.ArtifactStagingDirectory)
+      #env:
+      #  AZURE_DEVOPS_PAT: <YourPATToken> can do environment variable instead of command line for PAT tokens
+  - task: PublishBuildArtifacts@1
+    inputs:
+      PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+      ArtifactName: 'scan-results'
+      publishLocation: 'Container'
+

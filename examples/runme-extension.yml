@@ -1,0 +1,14 @@
+trigger: none
+
+pool:
+  # Azure public agents have time out of 60 min by default can go up to 360 minutes
+  vmImage: ubuntu-latest
+
+jobs:
+- job: observesScan
+  timeoutInMinutes: 360
+  steps:
+  - task: observes@1
+    timeoutInMinutes: 360
+    inputs:
+      serviceConnection: 'my-observes-service-connection'
