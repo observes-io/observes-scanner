@@ -122,12 +122,13 @@ The tool queries Azure DevOps and returns results as a JSON file. All sensitive 
 
 ### Required PAT Permissions
 
-The Azure DevOps Personal Access Token (PAT) should have the following permissions:
+The Azure DevOps Personal Access Token (PAT) must have the following permissions:
 
 - **Agent Pools (Read):** Access build agent pool data for pipeline and resource inventory.
 - **Analytics (Read):** Retrieve language metrics and analytics data for projects and repositories.
 - **Build (Read):** Query build definitions, pipeline runs, build results, and dry runs (preview yaml).
 - **Code (Read):** Access repositories, commits, branches, pull requests, and committer information.
+- **Environment (Read & Manage):** Access environments data. (We only read data and do not modify it, it is not possible to set read-only permission for environments)
 - **Graph (Read):** Access users, groups, and service principals for identity and permissions mapping.
 - **Project and Team (Read):** List and query projects, teams, and related metadata.
 - **Secure Files (Read):** Access secure files used in pipelines and releases. We are unable to read the contents.
@@ -186,7 +187,7 @@ We are committed to supply chain security and transparency. A Software Bill of M
 - [Observes.io Documentation Home](https://observes.io/docshome/)
 - [Scanner Source Code GitHub Repository](https://github.com/observes-io/observes-scanner)
 - [UI Source Code GitHub Repository](https://github.com/observes-io/observes-ui)
-- [Observes Azure DevOps Marketplace](https://marketplace.visualstudio.com/items?itemName=Observesio.observes) <!-- @TODO Replace with actual ext -->
+- [Observes Azure DevOps Marketplace](https://marketplace.visualstudio.com/items?itemName=Observesio.observes)
 - [App https://app.observes.io/](https://app.observes.io/) or your own self-hosted version
 
 ---

@@ -16,7 +16,9 @@ from datetime import datetime
 import re
 
 
-def scan_azdevops(organization, job_id, pat_token=None, results_dir=None, enable_secrets_scanner=False, projects=None):
+def scan_azdevops(organization, job_id, pat_token=None, results_dir=None, 
+                  #enable_secrets_scanner=False, 
+                  projects=None):
     if not organization:
         raise ValueError("Organization must be provided")
     if not job_id:
@@ -67,6 +69,26 @@ def scan_azdevops(organization, job_id, pat_token=None, results_dir=None, enable
             "api_version": "?api-version=7.1",
             "protected_resources": [],
             "level": "project"
+        },
+        # "deploymentgroups": {
+        #     "api_endpoint": "distributedtask/deploymentgroups",
+        #     "api_version": "?api-version=7.1",
+        #     "protected_resources": [],
+        #     "level": "project"
+        # },
+        # needs other permissions
+        # "deploymentPoolsSummary": {
+        #     "api_endpoint": "distributedtask/deploymentPools/deploymentPoolsSummary?expands=2",
+        #     "api_version": "",
+        #     "protected_resources": [],
+        #     "level": "org"
+        # },
+        "environment": {
+            "api_endpoint": "distributedtask/environments",
+            "query_params": "expands=1",
+            "api_version": "?api-version=7.1",
+            "protected_resources": [],
+            "level": "project"
         }
     }
 
@@ -92,37 +114,37 @@ def scan_azdevops(organization, job_id, pat_token=None, results_dir=None, enable
         "publishPipelineMetadata": True
     }
     try:
-        # Detect if gitleaks is installed
-        gitleaks_installed = shutil.which("gitleaks") is not None
+        # # Detect if gitleaks is installed
+        # gitleaks_installed = shutil.which("gitleaks") is not None
 
-        if not gitleaks_installed:
-            gunicorn_logger = logging.getLogger('gunicorn.error')
-            gunicorn_logger.warning("gitleaks is not installed, gitleaks scans will be skipped!")
+        # if not gitleaks_installed:
+        #     gunicorn_logger = logging.getLogger('gunicorn.error')
+        #     gunicorn_logger.warning("gitleaks is not installed, gitleaks scans will be skipped!")
 
         start_time = time.time()
         start_date = datetime.now().isoformat()
-        process = psutil.Process(os.getpid())
-        max_mem = [0]
-        max_cpu = [0]
-        monitoring = [True]
-        def monitor_resources():
-            while monitoring[0]:
-                mem = process.memory_info().rss
-                cpu = process.cpu_percent(interval=0.1)
-                if mem > max_mem[0]:
-                    max_mem[0] = mem
-                if cpu > max_cpu[0]:
-                    max_cpu[0] = cpu
-                time.sleep(0.1)
-        monitor_thread = threading.Thread(target=monitor_resources)
-        monitor_thread.start()
+        # process = psutil.Process(os.getpid())
+        # max_mem = [0]
+        # max_cpu = [0]
+        # monitoring = [True]
+        # def monitor_resources():
+        #     while monitoring[0]:
+        #         mem = process.memory_info().rss
+        #         cpu = process.cpu_percent(interval=0.1)
+        #         if mem > max_mem[0]:
+        #             max_mem[0] = mem
+        #         if cpu > max_cpu[0]:
+        #             max_cpu[0] = cpu
+        #         time.sleep(0.1)
+        # monitor_thread = threading.Thread(target=monitor_resources)
+        # monitor_thread.start()
         try:
             az_manager = AzureDevOpsManager(
                 organization=organization,
                 project_filter=projects if projects else [],
                 default_build_settings_expectations=default_build_settings_expectations,
                 pat_token=pat_token,
-                gitleaks_installed=gitleaks_installed and enable_secrets_scanner
+                # gitleaks_installed=gitleaks_installed and enable_secrets_scanner
             )
 
             print(f"Starting scan for {organization} with job ID: {job_id}")
@@ -137,9 +159,9 @@ def scan_azdevops(organization, job_id, pat_token=None, results_dir=None, enable
             definitions, builds = az_manager.get_builds_per_definition_per_project()
 
             # 1.1 ENRICH WITH LOG SCAN
-            for build in builds:
-                if enable_secrets_scanner:
-                    build = az_manager.get_enriched_build_with_log_secret_scan(build, gitleaks_installed=gitleaks_installed)
+            # for build in builds:
+            #     if enable_secrets_scanner:
+            #          build = az_manager.get_enriched_build_with_log_secret_scan(build, gitleaks_installed=gitleaks_installed)
             
             # 1.2 PIPELINE PERMISSIONS
             definitions = az_manager.get_build_definition_authorised_resources(definitions)
@@ -174,9 +196,13 @@ def scan_azdevops(organization, job_id, pat_token=None, results_dir=None, enable
                 protected_resources_inventory_resources_checks_definitions["repository"]["protected_resources"],
                 commits
             )
+            
+            # 4. Get Artifacts
+            artifacts = az_manager.get_artifacts_feeds()
 
-            # 4. Enrich stats with resource counts
-            stats = az_manager.get_enriched_stats(stats, protected_resources_inventory_resources_checks_definitions, definitions, builds, commits)
+            # 5. Enrich stats with resource counts
+            stats = az_manager.get_enriched_stats(stats, protected_resources_inventory_resources_checks_definitions, definitions, builds, commits, artifacts)
+
 
             project_refs = [
                 {"id": proj["id"], "name": proj["name"]}
@@ -206,10 +232,13 @@ def scan_azdevops(organization, job_id, pat_token=None, results_dir=None, enable
                         "variablegroup": len(protected_resources_inventory_resources_checks_definitions["variablegroup"]["protected_resources"]),
                         "securefile": len(protected_resources_inventory_resources_checks_definitions["securefile"]["protected_resources"]),
                         "repository": len(protected_resources_inventory_resources_checks_definitions["repository"]["protected_resources"]),
+                        "environment": len(protected_resources_inventory_resources_checks_definitions["environment"]["protected_resources"]),
                         "pipelines": len(definitions),
                         "builds": len(builds),
                         "commits": len(commits),
                         "committers": len(committer_stats),
+                        "artifacts_feeds": len(artifacts["active"]) if "active" in artifacts else 0 + len(artifacts["recyclebin"]) if "recyclebin" in artifacts else 0,
+                        "artifacts_packages": sum(len(feed.get("packages", [])) for feed in artifacts.get("active", [])) if "active" in artifacts else 0,
                     }
                 },
                 "stats": stats,
@@ -221,6 +250,7 @@ def scan_azdevops(organization, job_id, pat_token=None, results_dir=None, enable
                 "commits": commits,
                 "committer_stats": committer_stats,
                 "build_service_accounts": build_service_accounts,
+                "artifacts": artifacts
             }
 
             # Save the results to a JSON file in the specified results directory
@@ -237,10 +267,10 @@ def scan_azdevops(organization, job_id, pat_token=None, results_dir=None, enable
 
             # Print file sizes for results and metadata
             results_size = os.path.getsize(output_path)
-            green = "\033[92m"
-            reset = "\033[0m"
-            print(f"{green}Scan completed successfully. Results folder is {results_dir}{reset}")
-            print(f"{green}Results file saved to {output_path} ({format_size(results_size)}){reset}")
+            # green = "\033[92m"
+            # reset = "\033[0m"
+            # print(f"{green}Scan completed successfully. Results folder is {results_dir}{reset}")
+            # print(f"{green}Results file saved to {output_path} ({format_size(results_size)}){reset}")
         except Exception as e:
             gunicorn_logger = logging.getLogger('gunicorn.error')
             gunicorn_logger.error(f"Error during scan: {e}")
@@ -249,17 +279,18 @@ def scan_azdevops(organization, job_id, pat_token=None, results_dir=None, enable
             print(f"{red}Error during scan: {e}{reset}", file=sys.stderr)
             sys.exit(1)
         finally:
-            monitoring[0] = False
-            monitor_thread.join()
-            purple = "\033[95m"
-            reset = "\033[0m"
-            end_time = time.time()
-            duration = end_time - start_time
-            print(f"{purple}Scan duration: {duration:.2f} seconds{reset}")
-            print(f"{purple}Max memory usage: {max_mem[0] / (1024 * 1024):.2f} MB (RSS){reset}")
-            total_cores = psutil.cpu_count(logical=True)
-            cpu_percent_of_total = max_cpu[0] / (total_cores if total_cores else 1)
-            print(f"{purple}Max CPU usage: {cpu_percent_of_total:.2f}% of total system capacity, {total_cores} cores{reset}")
+            print("Scan finished.")
+            # monitoring[0] = False
+            # monitor_thread.join()
+            # purple = "\033[95m"
+            # reset = "\033[0m"
+            # end_time = time.time()
+            # duration = end_time - start_time
+            # print(f"{purple}Scan duration: {duration:.2f} seconds{reset}")
+            # print(f"{purple}Max memory usage: {max_mem[0] / (1024 * 1024):.2f} MB (RSS){reset}")
+            # total_cores = psutil.cpu_count(logical=True)
+            # cpu_percent_of_total = max_cpu[0] / (total_cores if total_cores else 1)
+            # print(f"{purple}Max CPU usage: {cpu_percent_of_total:.2f}% of total system capacity, {total_cores} cores{reset}")
     except Exception as e:
         gunicorn_logger = logging.getLogger('gunicorn.error')
         gunicorn_logger.error(f"Error during scan: {e}")
@@ -284,7 +315,7 @@ def main():
     parser.add_argument('-j', '--job-id', required=True, help='Job ID for this scan')
     parser.add_argument('-p', '--pat-token', required=False, help='Azure DevOps Personal Access Token (can also be set via AZURE_DEVOPS_PAT environment variable)')
     parser.add_argument('-r', '--results-dir', default=None, help='Directory to save scan results (default: current working directory)')
-    parser.add_argument('--enable-secrets-scanner', action='store_true', help='Enable secrets scanner (default: disabled)')
+    #parser.add_argument('--enable-secrets-scanner', action='store_true', help='Enable secrets scanner (default: disabled)')
     parser.add_argument('--projects', default=None, help='Optional comma separated list of project names or IDs to filter scan')
     args = parser.parse_args()
 
@@ -300,7 +331,7 @@ def main():
         job_id=args.job_id,
         pat_token=pat_token,
         results_dir=args.results_dir,
-        enable_secrets_scanner=args.enable_secrets_scanner,
+        #enable_secrets_scanner=args.enable_secrets_scanner,
         projects=projects
     )
 

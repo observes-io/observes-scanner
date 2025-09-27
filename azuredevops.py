@@ -4,6 +4,27 @@ import subprocess, os, re, yaml
 from datetime import datetime, timedelta
 import logging
 
+from urllib3.util.retry import Retry
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def requests_session_with_retries(total=6, backoff_factor=1, status_forcelist=(500, 502, 503, 504)):
+    # Retry strategy for requests
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=total,
+        backoff_factor=backoff_factor,  # exponential backoff
+        status_forcelist=status_forcelist,
+        allowed_methods=["HEAD", "GET", "OPTIONS", "POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("https://", adapter)
+    return session
+
+# create a global session
+http = requests_session_with_retries()
 
 def fetch_data(url, token, qret=False):
 
@@ -14,7 +35,11 @@ def fetch_data(url, token, qret=False):
     
     try:
         print(f"\tData fetched from {url}")
-        response = requests.get(url=url, headers=headers)
+        try:
+            response = http.get(url=url, headers=headers)
+        except ConnectionResetError as cre:
+            print(f"\tConnection reset error occurred: {cre}")
+            return None
 
         if qret:
             return response.text
@@ -45,7 +70,7 @@ def post_data(url, payload, token):
         'Authorization': f'Basic {token}',
     }
     try:
-        response = requests.post(url=url, headers=headers, data=payload)
+        response = http.post(url=url, headers=headers, data=payload)
         response.raise_for_status()
         print(f"\tData posted to {url}")
         return response.json(), None
@@ -59,6 +84,110 @@ def post_data(url, payload, token):
         return None, str(err)
 
 class AzureDevOpsManager:
+    def get_feed_packages(self, feed_id, project_id=None):
+        """
+        Fetches packages for a given feed. If project_name is None, fetches org-level feed packages.
+        Returns a list of packages (may be empty).
+        """
+        if project_id:
+            packages_url = f"https://feeds.dev.azure.com/{self.organization}/{project_id}/_apis/packaging/feeds/{feed_id}/packages?api-version=7.1-preview.1&includeUrls=false"
+        else:
+            packages_url = f"https://feeds.dev.azure.com/{self.organization}/_apis/packaging/feeds/{feed_id}/packages?api-version=7.1-preview.1&includeUrls=false"
+        try:
+            packages = fetch_data(packages_url, self.token)
+            package_list = packages if isinstance(packages, list) else packages.get('value', packages) if packages else []
+            # For each package, fetch upstreaming behaviour if protocolType is supported
+            for pkg in package_list:
+                protocol = (pkg.get('protocolType') or '').lower()
+                if protocol in ('maven', 'nuget', 'npm', 'python'):
+                    # Build the correct upstreaming behaviour URL
+                    if project_id:
+                        base_url = f"https://pkgs.dev.azure.com/{self.organization}/{project_id}/_apis/packaging/feeds/{feed_id}"
+                    else:
+                        base_url = f"https://pkgs.dev.azure.com/{self.organization}/_apis/packaging/feeds/{feed_id}"
+                    if protocol == 'maven':
+                        upstream_url = f"{base_url}/maven/packages/{pkg.get('name')}/upstreaming"
+                    elif protocol == 'nuget':
+                        upstream_url = f"{base_url}/nuget/packages/{pkg.get('name')}/upstreaming"
+                    elif protocol == 'npm':
+                        upstream_url = f"{base_url}/npm/packages/{pkg.get('name')}/upstreaming"
+                    elif protocol == 'python':
+                        upstream_url = f"{base_url}/python/packages/{pkg.get('name')}/upstreaming"
+                    else:
+                        upstream_url = None
+                    if upstream_url:
+                        try:
+                            behaviour = fetch_data(upstream_url, self.token)
+                            if isinstance(behaviour, dict) and 'versionsFromExternalUpstreams' in behaviour:
+                                pkg['versionsFromExternalUpstreams'] = behaviour['versionsFromExternalUpstreams']
+                            else:
+                                pkg['versionsFromExternalUpstreams'] = behaviour
+                        except Exception as e:
+                            pkg['versionsFromExternalUpstreams'] = {'error': str(e)}
+            return package_list
+        except Exception as e:
+            print(f"Failed to fetch packages for feed {feed_id} (project: {project_id}): {e}")
+            return []
+    def get_feed_views(self, feed_id, project_id=None):
+        """
+        Fetches views for a given feed. If project_name is None, fetches org-level feed views.
+        Returns a list of views (may be empty).
+        """
+        if project_id:
+            views_url = f"https://feeds.dev.azure.com/{self.organization}/{project_id}/_apis/packaging/feeds/{feed_id}/views?api-version=7.1-preview.1"
+        else:
+            views_url = f"https://feeds.dev.azure.com/{self.organization}/_apis/packaging/feeds/{feed_id}/views?api-version=7.1-preview.1"
+        try:
+            views = fetch_data(views_url, self.token)
+            return views if isinstance(views, list) else views.get('value', views) if views else []
+        except Exception as e:
+            print(f"Failed to fetch views for feed {feed_id} (project: {project_id}): {e}")
+            return []
+    def get_artifacts_feeds(self):
+        """
+        Fetches Azure Artifacts feeds for the organization and for each project, including feeds in the recycle bin.
+        Returns a dict with 'organization', 'organization_recyclebin', 'projects', and 'projects_recyclebin' keys.
+        Each project feed will include a 'k_project' field for consistency.
+        """
+        feeds = {'active': [], 'recyclebin': []}
+        # Fetch org-level feeds
+        org_url = f"https://feeds.dev.azure.com/{self.organization}/_apis/packaging/feeds?api-version=7.1"
+        org_recyclebin_url = f"https://feeds.dev.azure.com/{self.organization}/_apis/packaging/feedRecycleBin?api-version=7.1-preview.1"
+        try:
+            org_feeds = fetch_data(org_url, self.token)
+            org_feeds_list = org_feeds if isinstance(org_feeds, list) else org_feeds.get('value', []) if org_feeds else []
+            for feed in org_feeds_list:
+                
+                feed['k_enabled'] = True
+                feed_id = feed.get('id') or feed.get('name')
+                project = feed.get('project')
+                if project:
+                    feed['k_feed_type'] = 'project'
+                    feed['k_project'] = self.enrich_k_project(project.get('id'), f"https://dev.azure.com/{self.organization}/{project.get('name')}/_artifacts/feed/{feed.get('name')}")
+                else:
+                    feed['k_feed_type'] = 'organization'
+                feed['views'] = self.get_feed_views(feed_id, project_id=project.get('id') if project else None)
+                feed['packages'] = self.get_feed_packages(feed_id, project_id=project.get('id') if project else None)
+            if org_feeds:
+                feeds['active'] = org_feeds_list
+        except Exception as e:
+            print(f"Failed to fetch organization feeds: {e}")
+
+        # Fetch org-level feeds in recycle bin
+        try:
+            org_recyclebin = fetch_data(org_recyclebin_url, self.token)
+            org_recyclebin_list = org_recyclebin if isinstance(org_recyclebin, list) else org_recyclebin.get('value', []) if org_recyclebin else []
+            for feed in org_recyclebin_list:
+                feed['k_feed_type'] = 'recyclebin'
+                if project:
+                    feed['k_project'] = self.enrich_k_project(project.get('id'), f"https://dev.azure.com/{self.organization}/{project.get('name')}/_artifacts/feed/{feed.get('name')}")
+                feed['k_enabled'] = False
+            if org_recyclebin:
+                feeds['recyclebin'] = org_recyclebin_list
+        except Exception as e:
+            print(f"Failed to fetch organization recycle bin feeds: {e}")
+
+        return feeds
     def enrich_repositories_with_committer_stats(self, protected_resources, commits):
         """
         For each repository in protected_resources, add stats['committers']['count'] and stats['committers']['uniqueCommitters'] (list of unique committer emails).
@@ -335,7 +464,9 @@ class AzureDevOpsManager:
             if first_commit_date_str:
                 first_commit_date = datetime.datetime.fromisoformat(first_commit_date_str.replace('Z', '+00:00'))
         return (first_commit_date, last_commit_date)
-    def __init__(self, organization, project_filter, pat_token,default_build_settings_expectations={}, branch_limit=5, gitleaks_installed=True, exception_strings=False):
+    def __init__(self, organization, project_filter, pat_token,default_build_settings_expectations={}, branch_limit=5, 
+                 #gitleaks_installed=True, 
+                 exception_strings=False):
         self.organization = organization
         self.token = base64.b64encode(f":{pat_token}".encode()).decode()
         self.default_build_settings_expectations = default_build_settings_expectations
@@ -346,13 +477,14 @@ class AzureDevOpsManager:
         self.repo_scan = {
             "top": branch_limit, 
         }
-        self.gitleaks_installed = gitleaks_installed
+        #self.gitleaks_installed = gitleaks_installed
         # by default ignores same organization domains
 
 
     def get_projects(self, api_endpoint="projects", api_version="?api-version=7.1-preview.4", project_filter=None):
 
         url = f"https://dev.azure.com/{self.organization}/_apis/{api_endpoint}{api_version}"
+        url_deleted = f"https://dev.azure.com/{self.organization}/_apis/{api_endpoint}{api_version}&stateFilter=deleted"
 
         headers = {
             'Content-Type': 'application/json',
@@ -366,11 +498,18 @@ class AzureDevOpsManager:
             print(f"\tDISCOVERING projects")
             self.projects = {}
             
-            response = requests.get(url, headers=headers)
+            response = http.get(url, headers=headers)
             response.raise_for_status()
 
             # Parse JSON response
             data = response.json()
+
+            # Include deleted projects
+            response_deleted = http.get(url_deleted, headers=headers)
+            response_deleted.raise_for_status()
+            data_deleted = response_deleted.json()
+            if 'value' in data_deleted:
+                data['value'].extend(data_deleted['value'])
 
             if project_filter:
                 # Filter projects based on the provided project_filter & add general project settings
@@ -380,6 +519,9 @@ class AzureDevOpsManager:
                         # Project base with filter
                         self.projects[project['id']] = project
                         
+                        if project['state'] == "deleted":
+                            print(f"\t\tProject {project['name']} ({project['id']}) is DELETED")
+                            continue
                         # Build Settings
                         build_general_settings = self.get_project_build_general_settings(project['id'])
                         build_metrics = self.get_project_build_metrics(project['id'])
@@ -407,6 +549,10 @@ class AzureDevOpsManager:
                 for project in data['value']:
                     # Project base without filter
                     self.projects[project['id']] = project
+
+                    if project['state'] == "deleted":
+                        print(f"\t\tProject {project['name']} ({project['id']}) is DELETED")
+                        continue
 
                     # Build Settings
                     build_general_settings = self.get_project_build_general_settings(project['id'])
@@ -489,6 +635,9 @@ class AzureDevOpsManager:
                     if 'queues' in resource and isinstance(resource['queues'], list) and len(resource['queues']) > 1:
                         resource['isCrossProject'] = True
 
+                    # @TODO - check for multiple projects in deployment groups
+                    
+
                     # ELSE check k_projects
                     elif 'k_projects' in resource and isinstance(resource['k_projects'], list) and len(resource['k_projects']) > 1:
                         resource['isCrossProject'] = True
@@ -562,6 +711,10 @@ class AzureDevOpsManager:
 
                 elif inventory_key == "repository":
                     for project in self.projects:
+                        # Only process wellFormed projects
+                        if isinstance(self.projects[project], dict):
+                            if self.projects[project].get('state', '').lower() != 'wellformed':
+                                continue
                         # repos need to access the projectid.repoid and needs to be retrieved at a build level - and still not great visibility, because its a mix between pipeline + user + service account / group permissions - RBAC settings matter
                         url = f"https://dev.azure.com/{self.organization}/{project}/_apis/pipelines/pipelinepermissions/{inventory_key}/{actual_resource['project']['id']}.{actual_resource['id']}"
                         data = fetch_data(url, self.token)
@@ -609,6 +762,10 @@ class AzureDevOpsManager:
                             protected_resource['resource']['pipelinepermissions'] = list(set(protected_resource['resource']['pipelinepermissions']))
                 else:
                     for project in self.projects:
+                        # Only process wellFormed projects
+                        if isinstance(self.projects[project], dict):
+                            if self.projects[project].get('state', '').lower() != 'wellformed':
+                                continue
 
                         # for queues, variable groups, secure files. these are project scoped resources
 
@@ -625,7 +782,16 @@ class AzureDevOpsManager:
                             if 'allPipelines' in data.keys():
                                 if 'pipelinepermissions' not in protected_resource['resource']:
                                     protected_resource['resource']['pipelinepermissions'] = []
-                                protected_resource['resource']['pipelinepermissions'].extend([definition_id for definition_id in all_definitions if definition_id not in protected_resource['resource']['pipelinepermissions'] and definition_id.startswith(project)])
+                                # Fix: all_definitions may be dicts, not strings
+                                for definition in all_definitions:
+                                    # If definition is a dict, get its k_key
+                                    if isinstance(definition, dict):
+                                        definition_id = definition.get('k_key')
+                                    else:
+                                        definition_id = definition
+                                    if isinstance(definition_id, str) and definition_id.startswith(str(project)):
+                                        if definition_id not in protected_resource['resource']['pipelinepermissions']:
+                                            protected_resource['resource']['pipelinepermissions'].append(definition_id)
                             else:
                                 if 'pipelinepermissions' not in protected_resource['resource']:
                                     protected_resource['resource']['pipelinepermissions'] = []
@@ -760,6 +926,11 @@ class AzureDevOpsManager:
 
         # For each project, get the pipelines
         for project in self.projects:
+            # Only process wellFormed projects
+            if isinstance(self.projects[project], dict):
+                if self.projects[project].get('state', '').lower() != 'wellformed':
+                    continue
+
             url = f"https://dev.azure.com/{self.organization}/{project}/{manager_pipeline['build_definitions']['api_endpoint']}?{manager_pipeline['build_definitions']['api_version']}"
             build_definitions = fetch_data(url, self.token)
             if build_definitions is None:
@@ -866,6 +1037,10 @@ class AzureDevOpsManager:
                     decoded_string = urllib.parse.unquote(urllib.parse.unquote(project_name))
                     source_project_id = None
                     for key, value in self.projects.items():
+                        # Only process wellFormed projects
+                        if isinstance(self.projects[project], dict):
+                            if self.projects[project].get('state', '').lower() != 'wellformed':
+                                continue
                         if value['name'] == decoded_string:
                             source_project_id = key
                             break
@@ -878,6 +1053,7 @@ class AzureDevOpsManager:
                             if build_definition['queueStatus'] == "disabled":
                                 # If the build definition is disabled, no preview available
                                 enriched_build_definition['builds']['preview'][branches_name] = {}
+                                enriched_build_definition['builds']['preview'][branches_name]['is_yaml_preview_available'] = False
                                 enriched_build_definition['builds']['preview'][branches_name]['yaml'] = "Build Definition is disabled"
                                 enriched_build_definition['builds']['preview'][branches_name]['pipeline_recipe'] = "Build Definition is disabled"
                                 enriched_build_definition['builds']['preview'][branches_name]['cicd_sast'] = []
@@ -1007,129 +1183,129 @@ class AzureDevOpsManager:
 
         return build_definitions
 
-    def get_enriched_build_with_log_secret_scan(self, build, secrets_engine="gitleaks", gitleaks_installed=True):
-        if not gitleaks_installed:
-            return build  # Skip secret scanning and do not print info
+    # def get_enriched_build_with_log_secret_scan(self, build, secrets_engine="gitleaks", gitleaks_installed=True):
+    #     if not gitleaks_installed:
+    #         return build  # Skip secret scanning and do not print info
 
-        secret_scanning_logs = []
-        url = build['logs']['url']
+    #     secret_scanning_logs = []
+    #     url = build['logs']['url']
 
-        headers = {
-            'Content-Type': 'application/json',
-            'Authorization': f'Basic {self.token}',
-        }
+    #     headers = {
+    #         'Content-Type': 'application/json',
+    #         'Authorization': f'Basic {self.token}',
+    #     }
 
-        try:
-            response = requests.get(url, headers=headers)
-            response.raise_for_status()
+    #     try:
+    #         response = http.get(url, headers=headers)
+    #         response.raise_for_status()
 
-            # Parse JSON response
+    #         # Parse JSON response
 
-            try:
-                metadata_logs = response.json()
-            except json.JSONDecodeError:
-                print(f"\tCould not parse log JSON response for build {build['id']}")
-                return secret_scanning_logs
+    #         try:
+    #             metadata_logs = response.json()
+    #         except json.JSONDecodeError:
+    #             print(f"\tCould not parse log JSON response for build {build['id']}")
+    #             return secret_scanning_logs
 
 
-            if 'value' not in metadata_logs.keys() or len(metadata_logs['value']) == 0:
-                print(f"\tNo logs for build {build['id']}")
-                return
+    #         if 'value' not in metadata_logs.keys() or len(metadata_logs['value']) == 0:
+    #             print(f"\tNo logs for build {build['id']}")
+    #             return
             
-            build_secret_results = []
-            regex_results = []
+    #         build_secret_results = []
+    #         regex_results = []
 
-            for metadata_log in metadata_logs['value']:
-                url = metadata_log['url']
+    #         for metadata_log in metadata_logs['value']:
+    #             url = metadata_log['url']
 
-                headers = {
-                    'Content-Type': 'application/json',
-                    'Authorization': f'Basic {self.token}',
-                }
+    #             headers = {
+    #                 'Content-Type': 'application/json',
+    #                 'Authorization': f'Basic {self.token}',
+    #             }
 
-                try:
-                    response = requests.get(url, headers=headers)
-                    response.raise_for_status()
+    #             try:
+    #                 response = http.get(url, headers=headers)
+    #                 response.raise_for_status()
 
-                    # Parse JSON response
-                    logs = response.text
+    #                 # Parse JSON response
+    #                 logs = response.text
 
-                except requests.exceptions.HTTPError as http_err:
-                    print(f"\tHTTP error occurred while fetching logs: {http_err}")
+    #             except requests.exceptions.HTTPError as http_err:
+    #                 print(f"\tHTTP error occurred while fetching logs: {http_err}")
                 
-                selectedEngine = secrets_engine
-                results = {}
+    #             selectedEngine = secrets_engine
+    #             results = {}
 
-                if logs and selectedEngine == "gitleaks" and gitleaks_installed:
-                    results = self.scan_text_gitleaks(logs, url)
-                if results and results != []:
-                    build_secret_results.append(results)
-                else:
-                    pass
+    #             if logs and selectedEngine == "gitleaks" and gitleaks_installed:
+    #                 results = self.scan_text_gitleaks(logs, url)
+    #             if results and results != []:
+    #                 build_secret_results.append(results)
+    #             else:
+    #                 pass
 
-                engine = "regex"
-                scope = "pipeline_execution_logs"
-                if metadata_log['id'] == 1 and logs:
-                    regex_results = self.scan_string_with_regex(logs, engine, url)
+    #             engine = "regex"
+    #             scope = "pipeline_execution_logs"
+    #             if metadata_log['id'] == 1 and logs:
+    #                 regex_results = self.scan_string_with_regex(logs, engine, url)
                 
 
-            if 'cicd_sast' not in build.keys():
-                build['cicd_sast'] = []
+    #         if 'cicd_sast' not in build.keys():
+    #             build['cicd_sast'] = []
         
-            build['cicd_sast'].append({
-                "engine": engine,
-                "scope": scope,
-                "results": regex_results,
-            })
+    #         build['cicd_sast'].append({
+    #             "engine": engine,
+    #             "scope": scope,
+    #             "results": regex_results,
+    #         })
 
-            build['cicd_sast'].append({
-                "engine": "gitleaks",
-                "scope": "build_logs",
-                "results": build_secret_results,
-            })
+    #         build['cicd_sast'].append({
+    #             "engine": "gitleaks",
+    #             "scope": "build_logs",
+    #             "results": build_secret_results,
+    #         })
 
-            return build
+    #         return build
 
-        except requests.exceptions.HTTPError as http_err:
-            print(f"\tHTTP error occurred while fetching logs: {http_err}")
+    #     except requests.exceptions.HTTPError as http_err:
+    #         print(f"\tHTTP error occurred while fetching logs: {http_err}")
 
-    def scan_text_gitleaks(self, data_to_scan, source_of_data):
+    # def scan_text_gitleaks(self, data_to_scan, source_of_data):
 
-        """Runs gitleaks scan and returns found secrets. Assumes gitleaks is installed if called."""
+    #     """Runs gitleaks scan and returns found secrets. Assumes gitleaks is installed if called."""
 
-        gitleaks_args = ["gitleaks", "stdin", "--redact", "--verbose", "--no-banner"]
-        process = subprocess.run(
-            gitleaks_args,
-            input=data_to_scan, text=True, capture_output=True
-        )
-        secrets_found = []
-        # Extract findings using regex
-        pattern = re.compile(r"Finding:\s+(.*)\nSecret:\s+(.*)\nRuleID:\s+(.*)\nEntropy:\s+([\d.]+)")
-        matches = pattern.findall(process.stdout)
-        for match in matches:
-            finding, secret, rule_id, entropy = match
-            secrets_found.append({
-                "finding": finding,
-                "secret": secret,
-                "rule_id": rule_id,
-                "entropy": entropy
-            })
+    #     gitleaks_args = ["gitleaks", "stdin", "--redact", "--verbose", "--no-banner"]
+    #     process = subprocess.run(
+    #         gitleaks_args,
+    #         input=data_to_scan, text=True, capture_output=True
+    #     )
+    #     secrets_found = []
+    #     # Extract findings using regex
+    #     pattern = re.compile(r"Finding:\s+(.*)\nSecret:\s+(.*)\nRuleID:\s+(.*)\nEntropy:\s+([\d.]+)")
+    #     matches = pattern.findall(process.stdout)
+    #     for match in matches:
+    #         finding, secret, rule_id, entropy = match
+    #         secrets_found.append({
+    #             "finding": finding,
+    #             "secret": secret,
+    #             "rule_id": rule_id,
+    #             "entropy": entropy
+    #         })
 
-        # Filter out any non-normal characters from the secrets_found data
-        sanitized_secrets = []
-        for secret in secrets_found:
-            sanitized_secret = {
-                "source": source_of_data,
-                "finding": re.sub(r'\x1B(?:[@-Z\\-_]|\\[[0-?]*[ -/]*[@-~])', '', secret["finding"]),
-                "secret": re.sub(r'\x1B(?:[@-Z\\-_]|\\[[0-?]*[ -/]*[@-~])', '', secret["secret"]),
-                "rule_id": re.sub(r'\x1B(?:[@-Z\\-_]|\\[[0-?]*[ -/]*[@-~])', '', secret["rule_id"]),
-                "entropy": re.sub(r'\x1B(?:[@-Z\\-_]|\\[[0-?]*[ -/]*[@-~])', '', secret["entropy"]),
-            }
-            sanitized_secrets.append(sanitized_secret)
+    #     # Filter out any non-normal characters from the secrets_found data
+    #     sanitized_secrets = []
+    #     for secret in secrets_found:
+    #         sanitized_secret = {
+    #             "source": source_of_data,
+    #             "finding": re.sub(r'\x1B(?:[@-Z\\-_]|\\[[0-?]*[ -/]*[@-~])', '', secret["finding"]),
+    #             "secret": re.sub(r'\x1B(?:[@-Z\\-_]|\\[[0-?]*[ -/]*[@-~])', '', secret["secret"]),
+    #             "rule_id": re.sub(r'\x1B(?:[@-Z\\-_]|\\[[0-?]*[ -/]*[@-~])', '', secret["rule_id"]),
+    #             "entropy": re.sub(r'\x1B(?:[@-Z\\-_]|\\[[0-?]*[ -/]*[@-~])', '', secret["entropy"]),
+    #         }
+    #         sanitized_secrets.append(sanitized_secret)
 
-        return sanitized_secrets
+    #     return sanitized_secrets
 
-    def get_enriched_stats(self, stats, resource_inventory, definitions, builds, commits):
+    def get_enriched_stats(self, stats, resource_inventory, definitions, builds, commits, artifacts):
         print("Enriching stats with resource counts")
 
         for project in stats:
@@ -1168,6 +1344,10 @@ class AzureDevOpsManager:
                 r for r in resource_inventory['repository']['protected_resources']
                 if r['resource'].get('k_project') and project == r['resource']['k_project']['id']
             ])
+            stats[project]["resource_counts"]["environment"] = len([
+                r for r in resource_inventory['environment']['protected_resources']
+                if r['resource'].get('k_project') and project == r['resource']['k_project']['id']
+            ])
             stats[project]["resource_counts"]["commits"] = len([
                 c for c in commits
                 if c.get('k_project') and project == c['k_project']['id']
@@ -1180,6 +1360,27 @@ class AzureDevOpsManager:
             }
             stats[project]["resource_counts"]["unique_committers"] = len(unique_committers)
 
+            # Artifact feeds: count feeds in active+recyclebin where k_project.id==project or no k_project (org-wide)
+            feeds_count = 0
+            for feed in artifacts.get('active', []):
+                k_proj = feed.get('k_project')
+                if (k_proj and k_proj.get('id') == project) or (not k_proj):
+                    feeds_count += 1
+            for feed in artifacts.get('recyclebin', []):
+                k_proj = feed.get('k_project')
+                if (k_proj and k_proj.get('id') == project) or (not k_proj):
+                    feeds_count += 1
+            stats[project]["resource_counts"]["artifacts_feeds"] = feeds_count
+
+            # Artifact packages: sum of len(packages) for each active feed where k_project.id==project or no k_project (org-wide)
+            packages_count = 0
+            for feed in artifacts.get('active', []):
+                k_proj = feed.get('k_project')
+                if (k_proj and k_proj.get('id') == project) or (not k_proj):
+                    packages = feed.get('packages', [])
+                    if isinstance(packages, list):
+                        packages_count += len(packages)
+            stats[project]["resource_counts"]["artifacts_packages"] = packages_count
 
         return stats
 
@@ -1277,11 +1478,59 @@ class AzureDevOpsManager:
             case "repository":
                 resource['k_project'] = self.enrich_k_project(curr_project_id, resource.get('webUrl'))
                 return resource
+            case "environment":
+                resource['k_project'] = self.enrich_k_project(curr_project_id, f"https://dev.azure.com/{self.organization}/{curr_project_id}/_environments/{resource['id']}")
+                return resource
         return resource
+
+    def get_deployment_group_details(self, project_id, deployment_group):
+
+        # deployment groups are project specific (like queues) 
+        # get deployment pool from it - deployment_group['pool']
+
+        # to get all deploymentgroups associated with a single pool, is in the end merge of pools and deploymentgroups - for each pool, get all deploymentgroups associated with it
+        
+        # they link to a deploymentPool (like pools) which link to machines (targets)
+        # they also link to environments (see based on the name)
+
+
+        # get macghines and pool
+        url = f"https://dev.azure.com/{self.organization}/{project_id}/_apis/distributedtask/deploymentgroups/{deployment_group['id']}"
+        headers = {
+            'Content-Type': 'application/json',
+            'Authorization': f'Basic {self.token}',
+        }
+
+        try:
+            response = http.get(url, headers=headers)
+            response.raise_for_status()
+
+            data = response.json()
+            deployment_group['machines'] = data.get('machines', []) # targets
+            deployment_group['pool'] = data.get('pool', {})         # org level concept - has permissions?
+
+            deployment_group['tags'] = data.get('tags', [])
+            deployment_group['createdBy'] = data.get('createdBy', {})
+            deployment_group['modifiedBy'] = data.get('modifiedBy', {})
+            deployment_group['createdOn'] = data.get('createdOn', "")
+            deployment_group['modifiedOn'] = data.get('modifiedOn', "")
+
+            return deployment_group
+
+        except requests.exceptions.HTTPError as http_err:
+            print(f"\tHTTP error occurred while fetching deployment group details: {http_err}")
+        except Exception as err:
+            print(f"\tAn error occurred while fetching deployment group details: {err}")
+
+        return deployment_group
 
     def get_protected_resources(self, inventory):
 
         for project in self.projects:
+            # Only process wellFormed projects
+            if isinstance(self.projects[project], dict):
+                if self.projects[project].get('state', '').lower() != 'wellformed':
+                    continue
 
             for inventory_key, inventory_value in inventory.items():
                 
@@ -1289,6 +1538,9 @@ class AzureDevOpsManager:
                     url = f"https://dev.azure.com/{self.organization}/_apis/{inventory_value['api_endpoint']}"
                 else:    
                     url = f"https://dev.azure.com/{self.organization}/{project}/_apis/{inventory_value['api_endpoint']}"
+
+                if inventory_value.get('query_params'):
+                    url = f"{url}?{inventory_value['query_params']}"
 
                 headers = {
                     'Content-Type': 'application/json',
@@ -1299,7 +1551,7 @@ class AzureDevOpsManager:
                     print(f"\tDISCOVERING {inventory_key} @ {self.projects[project]['name']}")
                     
                     print(f"\t{url}")
-                    response = requests.get(url, headers=headers)
+                    response = http.get(url, headers=headers)
                     response.raise_for_status()
 
                     data = response.json()
@@ -1311,6 +1563,18 @@ class AzureDevOpsManager:
 
                     for new_resource in new_resources:
                         if new_resource['id'] not in curr_resources_ids:
+
+                            if inventory_key in ["environment", "deploymentgroups"]:
+                                # query individually /id
+                                url = f"https://dev.azure.com/{self.organization}/{project}/_apis/{inventory_value['api_endpoint']}/{new_resource['id']}?{inventory_value['query_params']}"
+                                print(f"\t\tEnriching {inventory_key} details for {new_resource['name']} @ {self.projects[project]['name']}")
+                                response = http.get(url, headers=headers)
+                                response.raise_for_status()
+                                try:
+                                    new_resource = response.json()
+                                except json.JSONDecodeError:
+                                    print(f"\t\tFailed to parse JSON for {inventory_key} {new_resource['name']} @ {self.projects[project]['name']}")
+                                    pass
 
                             pname = urllib.parse.quote(self.projects[project]['name'])
                             if inventory_key == "pools":
@@ -1325,8 +1589,14 @@ class AzureDevOpsManager:
                                 new_resource['k_url'] = f"https://dev.azure.com/{self.organization}/{pname}/_library?itemType=SecureFiles&view=SecureFileView&secureFileId={new_resource['id']}"
                             elif inventory_key == "variablegroup":
                                 new_resource['k_url'] = f"https://dev.azure.com/{self.organization}/{pname}/_library?itemType=VariableGroups&view=VariableGroupView&variableGroupId={new_resource['id']}"
+                            elif inventory_key == "environment":
+                                new_resource['k_url'] = f"https://dev.azure.com/{self.organization}/{pname}/_environments/{new_resource['id']}?view=deployments"
+                            elif inventory_key == "deploymentgroups":
+                                new_resource['k_url'] = f"https://dev.azure.com/{self.organization}/{pname}/_machinegroup?view=MachineGroupView&mgid={new_resource['id']}&tab=Details"
 
                             new_resource = self.enrich_protected_resources_projectinfo(inventory_key, new_resource, project)
+                            if inventory_key == "deploymentgroups":
+                                new_resource = self.get_deployment_group_details(project, new_resource)
 
                             enriched_resource = {
                                 "resourceType": inventory_key,
@@ -1385,14 +1655,29 @@ class AzureDevOpsManager:
         for resource_type in resource_inventory:
             for protected_resource in resource_inventory[resource_type]['protected_resources']:
                 actually_protected_resource = protected_resource['resource']
+                print(f"Processing {protected_resource['resourceType']} {actually_protected_resource['id']}")
                 if protected_resource['resourceType'] == "pools":
                     for queue in actually_protected_resource['queues']:
+                        if 'pipelinepermissions' not in actually_protected_resource:
+                            print("No pipelinepermissions found for this resource")
+                            continue
                         for pipelinepermission in queue['pipelinepermissions']:
                             if pipelinepermission not in definitions_map:
                                 definitions_map[pipelinepermission] = []
                             definitions_map[pipelinepermission].append(f"pool_merged_{actually_protected_resource['id']}")
                             definitions_map[pipelinepermission].append(f"queue_{queue['id']}")
+                elif protected_resource['resourceType'] == "deploymentgroups":
+                    print("Skipping deployment groups for now - permissions should be gotten from the pools/queues - so I would... lookup")
+                    print(actually_protected_resource)
+                    continue
+                    for pipelinepermission in actually_protected_resource['pipelinepermissions']:
+                        pipelinepermission = str(pipelinepermission['id'])
+                        if pipelinepermission not in definitions_map:
+                            definitions_map[pipelinepermission] = []
+                        definitions_map[pipelinepermission].append(f"{protected_resource['resourceType']}_{actually_protected_resource['id']}")
                 else:
+                    if 'pipelinepermissions' not in actually_protected_resource:
+                        actually_protected_resource['pipelinepermissions'] = []
                     for pipelinepermission in actually_protected_resource['pipelinepermissions']:
                         if pipelinepermission not in definitions_map:
                             definitions_map[pipelinepermission] = []
@@ -1445,7 +1730,7 @@ class AzureDevOpsManager:
             url = f"https://dev.azure.com/{self.organization}/{project_name}/_apis/projectanalysis/languagemetrics?api-version=6.0-preview.1"
 
             try:
-                response = requests.get(url, headers=headers)
+                response = http.get(url, headers=headers)
                 response.raise_for_status()
                 language_stats = response.json()
                 stats[project_id] = {
