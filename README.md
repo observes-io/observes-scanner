@@ -28,6 +28,8 @@ The scanner shapes the data to highlight relationships between CI/CD resources (
 
 > **Note:** We recommend using the Observes extension, as it comes prepackaged and enables you to manage scanning and results entirely within the Azure DevOps interface. If you want to install the extension in your ADO organisation you may require approvals for this - [Help me explain this extension](./extension.md)
 
+> **Note:** If you want to see environments, your PAT must also have **Environment (Read & Manage)**
+> We only require Read, but this is as much least privilege as it currently gets :(
 
 ## Guide: Onboarding Observes Scanner + UI
 
