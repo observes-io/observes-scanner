@@ -63,6 +63,27 @@ def fetch_data(url, token, qret=False):
         print(f"\tAn error occurred: {err}")
         return None
 
+def fetch_data_with_headers(url, token):
+    """Fetch data and return both the data and response headers (for continuation tokens)."""
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Basic {token}'
+    }
+    
+    try:
+        print(f"\tData fetched from {url}")
+        response = http.get(url=url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        result_data = data['value'] if 'value' in data.keys() else data
+        return result_data, response.headers
+    except requests.exceptions.HTTPError as http_err:
+        print(f"\tHTTP error occurred: {http_err}")
+        return None, None
+    except Exception as err:
+        print(f"\tAn error occurred: {err}")
+        return None, None
+
 def post_data(url, payload, token):
             
     """
@@ -678,8 +699,8 @@ class AzureDevOpsManager:
                 # if endpoint, use project references to store the individual permissions across projects
                 if inventory_key == "endpoint":
                     # pipeline permissions
-                    for current_projectReference in actual_resource['serviceEndpointProjectReferences']:
-                        project_id = current_projectReference['projectReference']['id']
+                    for current_project_reference in actual_resource['serviceEndpointProjectReferences']:
+                        project_id = current_project_reference['projectReference']['id']
                         url = f"https://dev.azure.com/{self.organization}/{project_id}/_apis/pipelines/pipelinepermissions/{inventory_key}/{actual_resource['id']}?api-version=7.1-preview.1"
                         data = fetch_data(url, self.token)
                         # permissions are per resource per project - adding to the pipelines object
@@ -690,32 +711,32 @@ class AzureDevOpsManager:
                                 build_def['k_key'] for build_def in all_definitions
                                 if build_def['k_key'] not in protected_resource['resource']['pipelinepermissions'] and build_def['k_key'].startswith(project_id)
                             ])
-                            if 'pipelinepermissions' not in current_projectReference['projectReference'].keys():
-                                current_projectReference['projectReference']['pipelinepermissions'] = []
-                            current_projectReference['projectReference']['pipelinepermissions'].extend([
+                            if 'pipelinepermissions' not in current_project_reference['projectReference'].keys():
+                                current_project_reference['projectReference']['pipelinepermissions'] = []
+                            current_project_reference['projectReference']['pipelinepermissions'].extend([
                                 build_def['k_key'] for build_def in all_definitions
-                                if build_def['k_key'] not in current_projectReference['projectReference']['pipelinepermissions'] and build_def['k_key'].startswith(project_id)
+                                if build_def['k_key'] not in current_project_reference['projectReference']['pipelinepermissions'] and build_def['k_key'].startswith(project_id)
                             ])
                         elif 'pipelines' in data.keys():
                             if 'pipelinepermissions' not in protected_resource['resource']:
                                 protected_resource['resource']['pipelinepermissions'] = []
                             protected_resource['resource']['pipelinepermissions'].extend([project_id+"_"+str(definition['id']) for definition in data['pipelines'] if project_id+"_"+str(definition['id']) not in protected_resource['resource']['pipelinepermissions']])
                             # also add it to the proj reference of the resource
-                            if 'pipelinepermissions' not in current_projectReference['projectReference'].keys():
-                                current_projectReference['projectReference']['pipelinepermissions'] = []
-                            current_projectReference['projectReference']['pipelinepermissions'].extend([project_id+"_"+str(definition['id']) for definition in data['pipelines'] if project_id+"_"+str(definition['id']) not in current_projectReference['projectReference']['pipelinepermissions']])
+                            if 'pipelinepermissions' not in current_project_reference['projectReference'].keys():
+                                current_project_reference['projectReference']['pipelinepermissions'] = []
+                            current_project_reference['projectReference']['pipelinepermissions'].extend([project_id+"_"+str(definition['id']) for definition in data['pipelines'] if project_id+"_"+str(definition['id']) not in current_project_reference['projectReference']['pipelinepermissions']])
                         else:
                             print(f"Data may be missing if the PAT token is not correctly scoped! Project ID {project_id} not found in self.projects. Do you need to increase the scope of the observability in config?")
-                            current_projectReference['projectReference']['pipelinepermissions'] = []
-                            current_projectReference['projectReference']['warning'] = f"Project ID {project_id} not found in self.projects. Do you need to increase the scope of the observability in config? PAT token may not have necessary permissions"
+                            current_project_reference['projectReference']['pipelinepermissions'] = []
+                            current_project_reference['projectReference']['warning'] = f"Project ID {project_id} not found in self.projects. Do you need to increase the scope of the observability in config? PAT token may not have necessary permissions"
                         
                         # @TODO - add the user permissions to the projectReference
 
                         # Ensure uniqueness for both resource and projectReference pipelinepermissions
                         if 'pipelinepermissions' in protected_resource['resource']:
                             protected_resource['resource']['pipelinepermissions'] = list(set(protected_resource['resource']['pipelinepermissions']))
-                        if 'pipelinepermissions' in current_projectReference['projectReference']:
-                            current_projectReference['projectReference']['pipelinepermissions'] = list(set(current_projectReference['projectReference']['pipelinepermissions']))
+                        if 'pipelinepermissions' in current_project_reference['projectReference']:
+                            current_project_reference['projectReference']['pipelinepermissions'] = list(set(current_project_reference['projectReference']['pipelinepermissions']))
 
 
                 elif inventory_key == "repository":
@@ -855,23 +876,134 @@ class AzureDevOpsManager:
         return findings 
 
 
-    def get_repository_branches(self, source_project_id, repo_id, project_name, repo_name):
+    def get_repository_branches(self, source_project_id, repo_id, project_name, repo_name, top_branches_to_scan, default_branch_name):
+        """
+        Fetches branches and sorts by last commit date.
+        - -1 = all branches
+        - 0 = default branch only
+        - N (>= 1) = top N branches by last commit date, ensuring default is included
+        """
 
+        all_branches = None
+        continuation_token = None
+
+        if top_branches_to_scan is None:
+            recent_branches_to_scan = 0
+
+        totalBranchesToFetch = top_branches_to_scan
         
-        # @TODO - should allow for a limited number of branches to be scanned (or all branches), order by createdDate, most recent ones first
-        # there are other ways to do this - GIT, TFVC, Repos...
+        if top_branches_to_scan <= -1:
+            totalBranchesToFetch = 1000  # Arbitrary large number to fetch all branches
+            top = 100
+        elif top_branches_to_scan == 0:
+            top = 1
+        else:
+            if top_branches_to_scan < 100:
+                top = top_branches_to_scan
+            else:
+                top = 100
+        
+        # Fetch all branches using continuation tokens
+        while True:
+            # Check if we've fetched enough branches
+            if all_branches is None:
+                all_branches = []
+            elif totalBranchesToFetch >= all_branches.__len__():
+                break
+            # Adjust top if nearing the totalBranchesToFetch limit
+            elif totalBranchesToFetch - all_branches.__len__() < top:
+                top = totalBranchesToFetch - all_branches.__len__()
 
-        branches_url = f"https://dev.azure.com/{self.organization}/{source_project_id}/_apis/git/repositories/{repo_id}/refs?includeStatuses=True&includeMyBranches=True&api-version=7.1"
-        branches = fetch_data(branches_url, self.token)
+            if top == 1 and continuation_token is None:
+                # If only fetching default branch, no need for continuation token
+                branches_url = f"https://dev.azure.com/{self.organization}/{source_project_id}/_apis/git/repositories/{repo_id}/refs?filter=heads%2F{default_branch_name}&api-version=7.1"
+            elif continuation_token:
+                branches_url = f"https://dev.azure.com/{self.organization}/{source_project_id}/_apis/git/repositories/{repo_id}/refs?$top={top}&api-version=7.1&continuationToken={continuation_token}"
+            else:
+                branches_url = f"https://dev.azure.com/{self.organization}/{source_project_id}/_apis/git/repositories/{repo_id}/refs?$top={top}&api-version=7.1"
+            
+            branches, headers = fetch_data_with_headers(branches_url, self.token)
+            
+            if branches is None:
+                print(f"Failed to fetch branches for {project_name}/{repo_name}.")
+                return [], []
+            
+            all_branches.extend(branches)
+            
+            # Check for continuation token in headers
+            continuation_token = headers.get('x-ms-continuationtoken') or headers.get('X-Ms-Continuationtoken')
+            if not continuation_token:
+                break
+        
+        # check if default branch is in the list
+        default_branch_found = any(branch['name'].endswith('/' + default_branch_name) for branch in all_branches)
+        if not default_branch_found:
+            print(f"\tWarning: Default branch '{default_branch_name}' not found in repository {project_name}/{repo_name} branches.")
+            # Get default branch specifically
+            default_branch_url = f"https://dev.azure.com/{self.organization}/{source_project_id}/_apis/git/repositories/{repo_id}/refs?filter=heads%2F{default_branch_name}&api-version=7.1"
+            default_branch_data = fetch_data(default_branch_url, self.token)
+            if default_branch_data and len(default_branch_data) > 0:
+                all_branches.extend(default_branch_data)
 
-        if branches is None:
-            print(f"Failed to fetch branches for {project_name}/{repo_name}.")
-            # May happen when the repo is disabled or not found
-            return [],[]
+        # Filter to only heads (branches), not tags
+        branches_only = [b for b in all_branches if b.get('name', '').startswith('refs/heads/')]
+        print(f"\tBranches for {project_name}/{repo_name}: {len(branches_only)} total")
+        
+        if not branches_only:
+            return [], []
+        
+        return branches_only, [branch['name'].split('/')[-1] for branch in branches_only]
+        
+        # # Return all branches if recent_branches_to_scan is -1
+        # if recent_branches_to_scan == -1:
+        #     branches_names = [branch['name'].split('/')[-1] for branch in branches_only]
+        #     return branches_only, branches_names
+        
+        # Get last commit date for each branch
+        # print(f"\tFetching last commit dates for branches...")
+        # for branch in branches_only:
+        #     branch_name = branch['name']
+        #     # Get last commit on this branch
+        #     commit_url = f"https://dev.azure.com/{self.organization}/{source_project_id}/_apis/git/repositories/{repo_id}/commits?searchCriteria.itemVersion.version={branch_name}&searchCriteria.$top=1&api-version=7.1"
+        #     commits = fetch_data(commit_url, self.token)
+        #     if commits and len(commits) > 0:
+        #         commit_date_str = commits[0].get('committer', {}).get('date', '')
+        #         if commit_date_str:
+        #             try:
+        #                 branch['k_lastCommitDate'] = datetime.fromisoformat(commit_date_str.replace('Z', '+00:00'))
+        #             except:
+        #                 branch['k_lastCommitDate'] = datetime.min
+        #         else:
+        #             branch['k_lastCommitDate'] = datetime.min
+        #     else:
+        #         branch['k_lastCommitDate'] = datetime.min
+        
+        # # Sort by last commit date (most recent first)
+        # branches_only.sort(key=lambda b: b.get('k_lastCommitDate', datetime.min), reverse=True)
+        
+        # # Return based on parameters
+        # if recent_branches_to_scan == 0:
+        #     # Return only the default branch
+        #     result_branches = [branch for branch in branches_only if branch['name'].endswith('/' + default_branch_name)]
+        #     if not result_branches and branches_only:
+        #         # Fallback to most recent branch if default not found
+        #         result_branches = [branches_only[0]]
+        #     branches_names = [branch['name'].split('/')[-1] for branch in result_branches]
+        #     return result_branches, branches_names
+        # else:
+        #     # Return top N recent branches, ensuring default is included
+        #     result_branches = branches_only[:recent_branches_to_scan]
+        #     branches_names = [branch['name'].split('/')[-1] for branch in result_branches]
 
-        print(f"\tBranches for {project_name}/{repo_name}")
-        branches_names = [branch['name'].split('/')[-1] for branch in branches]
-        return branches, branches_names
+        #     # If default branch is not in top N, replace the last branch with default
+        #     if default_branch_name not in branches_names:
+        #         for branch in branches_only:
+        #             if branch['name'].endswith('/' + default_branch_name):
+        #                 # Replace the last branch in result_branches with default
+        #                 result_branches[-1] = branch
+        #                 branches_names[-1] = default_branch_name
+        #                 break
+        #     return result_branches, branches_names
 
 
     def get_project_build_general_settings(self, project):
@@ -924,7 +1056,7 @@ class AzureDevOpsManager:
 
     # PIPELINES & PIPELINE RUNS
 
-    def get_builds_per_definition_per_project(self, manager_pipeline={"preview":{"api_version": "api-version=7.1", "api_endpoint": "_apis/pipelines"}, "builds":{"api_version": "api-version=7.1", "api_endpoint": "_apis/build/builds"}, "build_definitions":{"api_version": "api-version=7.1", "api_endpoint": "_apis/build/definitions"}}):
+    def get_builds_per_definition_per_project(self, manager_pipeline={"preview":{"api_version": "api-version=7.1", "api_endpoint": "_apis/pipelines"}, "builds":{"api_version": "api-version=7.1", "api_endpoint": "_apis/build/builds"}, "build_definitions":{"api_version": "api-version=7.1", "api_endpoint": "_apis/build/definitions"}}, top_branches_to_scan=0):
 
         # Get PIPELINES by project / "For each project"
         print("DISCOVERING PIPELINES")
@@ -1042,6 +1174,7 @@ class AzureDevOpsManager:
                     # where is the build definition
                     repo_id = enriched_build_definition['repository']['id']
                     repo_name = enriched_build_definition['repository']['name']
+                    default_branch = enriched_build_definition['repository'].get('defaultBranch', 'refs/heads/main')
                     project_name = enriched_build_definition['repository']['url'].split('/')[4]
                     decoded_string = urllib.parse.unquote(urllib.parse.unquote(project_name))
                     source_project_id = None
@@ -1056,8 +1189,15 @@ class AzureDevOpsManager:
                     if source_project_id is None:
                         print(f"Project name {decoded_string} not found in self.projects. Do you need to increase the scope of the observability in config? Trying to access a project outside the scope of the current access/token")
                     else:
-                        # Look at different branches of the repository where the configuration sits
-                        branches, branches_names = self.get_repository_branches(source_project_id, repo_id, project_name, repo_name)
+                        # check for branches to scan
+                        if top_branches_to_scan == 0:
+                            # only default branch
+                            branches = [enriched_build_definition['repository']['defaultBranch']]
+                            branches_names = [default_branch.split('/')[-1]]
+                        else:
+                            # Look at different branches of the repository where the configuration sits
+                            branches, branches_names = self.get_repository_branches(source_project_id, repo_id, project_name, repo_name, top_branches_to_scan, default_branch.split('/')[-1])
+
                         for branches_name in branches_names:
                             if build_definition['queueStatus'] == "disabled":
                                 # If the build definition is disabled, no preview available
@@ -1632,7 +1772,7 @@ class AzureDevOpsManager:
         for repository in inventory['repository']['protected_resources']:
             repo = repository['resource']
 
-            branches, branches_names = self.get_repository_branches(repo['project']['id'], repo['id'], repo['project']['name'], repo['name'])
+            branches, branches_names = self.get_repository_branches(repo['project']['id'], repo['id'], repo['project']['name'], repo['name'], -1, '')
             repo['branches'] = branches
 
             firstCommitDate, lastCommitDate = self.get_repository_commit_dates(repo['project']['id'], repo['id'])

@@ -7,7 +7,7 @@
 # Internal use only; additional clarifications in LICENSE-CLARIFICATIONS.md
 ####
 
-SCANNER_VERSION = "1.0.0"
+SCANNER_VERSION = "1.0.3"
 
 from azuredevops import AzureDevOpsManager
 import time
@@ -27,7 +27,8 @@ import re
 
 def scan_azdevops(organization, job_id, pat_token=None, results_dir=None, 
                   #enable_secrets_scanner=False, 
-                  projects=None):
+                  projects=None,
+                  top_branches_to_scan=0):
     if not organization:
         raise ValueError("Organization must be provided")
     if not job_id:
@@ -165,7 +166,7 @@ def scan_azdevops(organization, job_id, pat_token=None, results_dir=None,
             tasks = az_manager.get_task_list()
 
             # 1 PIPELINE DISCOVERY
-            definitions, builds = az_manager.get_builds_per_definition_per_project()
+            definitions, builds = az_manager.get_builds_per_definition_per_project(top_branches_to_scan=top_branches_to_scan)
 
             # 1.1 ENRICH WITH LOG SCAN
             # for build in builds:
@@ -324,6 +325,7 @@ def main():
     parser.add_argument('-j', '--job-id', required=True, help='Job ID for this scan')
     parser.add_argument('-p', '--pat-token', required=False, help='Azure DevOps Personal Access Token (can also be set via AZURE_DEVOPS_PAT environment variable)')
     parser.add_argument('-r', '--results-dir', default=None, help='Directory to save scan results (default: current working directory)')
+    parser.add_argument('-rb', '--top-branches-to-scan', type=int, default=5, help='Number of default plus top branches to scan for each repository. -1 for all branches, 0 for default branch only, >= X for default and X top branches (default: 5)')
     #parser.add_argument('--enable-secrets-scanner', action='store_true', help='Enable secrets scanner (default: disabled)')
     parser.add_argument('--projects', default=None, help='Optional comma separated list of project names or IDs to filter scan')
     args = parser.parse_args()
@@ -341,7 +343,8 @@ def main():
         pat_token=pat_token,
         results_dir=args.results_dir,
         #enable_secrets_scanner=args.enable_secrets_scanner,
-        projects=projects
+        projects=projects,
+        top_branches_to_scan=args.top_branches_to_scan
     )
 
 if __name__ == "__main__":

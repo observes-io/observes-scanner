@@ -1,7 +1,7 @@
 version = 1
 
 [[annotations]]
-path = ["**/*.md", "**/*.json", "requirements.txt", "Pipfile*" ]
+path = ["**/*.md", "**/*.json", "requirements.txt", "Pipfile*", ".azure-pipelines/*"]
 precedence = "override"
 SPDX-FileCopyrightText = "2025 Observes io LTD"
 SPDX-License-Identifier = "LicenseRef-PolyForm-Internal-Use-1.0.0"

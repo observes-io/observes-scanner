@@ -36,4 +36,4 @@ pip-wheel-metadata/
 .DS_Store
 Thumbs.db
 results
-.env
+.env.azure-pipelines/

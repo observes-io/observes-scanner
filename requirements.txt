@@ -1,3 +1,6 @@
 psutil==7.1.0
 requests==2.32.5
 pyyaml==6.0.3
+
+# pinning requests sub-dependencies
+urllib3==2.6.3
