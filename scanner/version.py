@@ -7,34 +7,6 @@
 # Internal use only; additional clarifications in LICENSE-CLARIFICATIONS.md
 ####
 
-node_modules
-# Python ignores
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*.pyc
-.Python
-env/
-venv/
-.venv/
-build/
-dist/
-.eggs/
-*.egg-info/
-*.egg
-pip-wheel-metadata/
-.cache/
-.pytest_cache/
-.coverage
-.tox/
-.mypy_cache/
-.pyre/
-# VS Code
-.vscode/
-# OS files
-.DS_Store
-Thumbs.db
-results
-.env.azure-pipelines/
-.azure-pipelines/
+"""Internal version helpers."""
+
+__version__ = "0.0.0"

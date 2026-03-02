@@ -36,7 +36,28 @@ jobs:
     inputs:
       script: |
         source .venv/bin/activate
-        python scan.py --organization <YourOrganization> --job-id $(Build.BuildId) --pat-token <YourPATToken> --results-dir $(Build.ArtifactStagingDirectory)
+        python scan.py \
+          --organization <your-organization> \
+          --job-id $(Build.BuildId) \
+          --pat-token <YourPATToken> \
+          --results-dir $(Build.ArtifactStagingDirectory) \
+          --projects <project1,project2> \
+          --top-branches-to-scan 5 \
+          --resolve-identities \
+          --skip-feeds \
+          --skip-builds \
+          --skip-committer-stats
+        # Remove or set values for options as needed. All options:
+        # --organization (required)
+        # --job-id (required)
+        # --pat-token (or set AZURE_DEVOPS_PAT env var)
+        # --results-dir
+        # --projects
+        # --top-branches-to-scan
+        # --resolve-identities
+        # --skip-feeds
+        # --skip-builds
+        # --skip-committer-stats
       #env:
       #  AZURE_DEVOPS_PAT: <YourPATToken> can do environment variable instead of command line for PAT tokens
   - task: PublishBuildArtifacts@1

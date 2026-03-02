@@ -7,24 +7,8 @@
 # Internal use only; additional clarifications in LICENSE-CLARIFICATIONS.md
 ####
 
-"""Compatibility facade for legacy imports.
-
-This module intentionally re-exports the public scanner symbols so existing
-consumers can keep importing from `azuredevops`.
-"""
+"""Scanner package."""
 
 from scanner.ado_client import AzureDevOpsManager
-from scanner.http_client import (
-    fetch_data,
-    fetch_data_with_headers,
-    post_data,
-    requests_session_with_retries,
-)
 
-__all__ = [
-    "AzureDevOpsManager",
-    "requests_session_with_retries",
-    "fetch_data",
-    "fetch_data_with_headers",
-    "post_data",
-]
+__all__ = ["AzureDevOpsManager"]

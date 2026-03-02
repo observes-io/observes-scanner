@@ -102,18 +102,28 @@ All configuration and options must be provided as CLI arguments. The following o
 -j, --job-id                 Job ID for this scan (required)
 -p, --pat-token              Azure DevOps Personal Access Token (optional if AZURE_DEVOPS_PAT is set)
 -r, --results-dir            Directory to save scan results (default: current working directory)
-    --enable-secrets-scanner Enable secrets scanner (default: disabled)
     --projects               Optional comma separated list of project names or IDs to filter scan
+    --top-branches-to-scan   Number of default plus top branches to scan for each repository. -1 for all branches, 0 for default branch only, >= X for default and X top branches (default: 5)
+    --resolve-identities     Enable identity resolution for service connections, variable groups, and secure files (requires laughing-lamp package)
+    --skip-feeds             Skip artifact feeds scanning for faster scans
+    --skip-builds             Skip builds scanning for faster scans
+    --skip-committer-stats   Skip committer stats calculation for faster scans
 ```
 
 Example usage:
 
 ```pwsh
-./observes-scanner.exe -o <organization> -j <job-id> -p <pat-token> [-r <results-dir>] [--enable-secrets-scanner] [--projects <project1,project2>]
-```
-Or, if running from source:
-```pwsh
-python scan.py -o <organization> -j <job-id> -p <pat-token> [-r <results-dir>] [--enable-secrets-scanner] [--projects <project1,project2>]
+python scan.py \
+  --organization <organization> \
+  --job-id <job-id> \
+  --pat-token <pat-token> \
+  --results-dir <results-dir> \
+  --projects <project1,project2> \
+  --top-branches-to-scan 5 \
+  --resolve-identities \
+  --skip-feeds \
+  --skip-committer-stats \
+  --skip-builds
 ```
 
 Alternatively, you can set the PAT as an environment variable:
