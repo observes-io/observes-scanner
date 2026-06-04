@@ -7,15 +7,16 @@
 # Internal use only; additional clarifications in LICENSE-CLARIFICATIONS.md
 ####
 
-SCANNER_VERSION = "1.1.0"
+SCANNER_VERSION = "1.2.0"
 
-import os
-import sys
+# @TODO: Remove. Unused imports
+# import os
+# import sys
+# from scanner.output import format_size
+# from scanner.config import ScannerConfig
 
 from scanner.cli import parse_config
-from scanner.config import ScannerConfig
 from scanner.orchestrator import run_scan
-from scanner.output import format_size
 
 
 def check_laughing_lamp_available():
@@ -27,39 +28,40 @@ def check_laughing_lamp_available():
         return False
 
 
-def scan_azdevops(
-    organization,
-    job_id,
-    pat_token=None,
-    results_dir=None,
-    projects=None,
-    top_branches_to_scan=0,
-    resolve_identities=False,
-    skip_feeds=False,
-    skip_committer_stats=False,
-    skip_builds=False,
-):
-    # Check if laughing-lamp is available when identity resolution is requested
-    if resolve_identities and not check_laughing_lamp_available():
-        print("\n" + "=" * 70)
-        print("WARNING: --resolve-identities requested but laughing-lamp is not installed.")
-        print("=" * 70)
-        print("\nContinuing scan without identity resolution...\n")
-        resolve_identities = False
+# @TODO: Remove. This is not being called - it's in the orchestrator now
+# def scan_azdevops(
+#     organization,
+#     job_id,
+#     pat_token=None,
+#     results_dir=None,
+#     projects=None,
+#     top_branches_to_scan=0,
+#     resolve_identities=False,
+#     skip_feeds=False,
+#     skip_committer_stats=False,
+#     skip_builds=False,
+# ):
+#     # Check if laughing-lamp is available when identity resolution is requested
+#     if resolve_identities and not check_laughing_lamp_available():
+#         print("\n" + "=" * 70)
+#         print("WARNING: --resolve-identities requested but laughing-lamp is not installed.")
+#         print("=" * 70)
+#         print("\nContinuing scan without identity resolution...\n")
+#         resolve_identities = False
     
-    config = ScannerConfig(
-        organization=organization,
-        job_id=job_id,
-        pat_token=pat_token,
-        results_dir=results_dir or os.getcwd(),
-        projects=projects or [],
-        top_branches_to_scan=top_branches_to_scan,
-        resolve_identities=resolve_identities,
-        skip_feeds=skip_feeds,
-        skip_committer_stats=skip_committer_stats,
-        skip_builds=skip_builds,
-    )
-    return run_scan(config=config, scanner_version=SCANNER_VERSION)
+#     config = ScannerConfig(
+#         organization=organization,
+#         job_id=job_id,
+#         pat_token=pat_token,
+#         results_dir=results_dir or os.getcwd(),
+#         projects=projects or [],
+#         top_branches_to_scan=top_branches_to_scan,
+#         resolve_identities=resolve_identities,
+#         skip_feeds=skip_feeds,
+#         skip_committer_stats=skip_committer_stats,
+#         skip_builds=skip_builds,
+#     )
+#     return run_scan(config=config, scanner_version=SCANNER_VERSION)
 
 
 def main():

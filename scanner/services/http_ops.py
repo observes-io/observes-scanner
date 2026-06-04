@@ -14,8 +14,9 @@ from scanner.services.runtime import endpoint_family
 
 
 class HttpOps:
-    def __init__(self, token: str, runtime_state, logger):
+    def __init__(self, token: str = None, runtime_state=None, logger=None, auth_provider=None):
         self.token = token
+        self.auth_provider = auth_provider
         self.runtime_state = runtime_state
         self.logger = logger
 
@@ -31,15 +32,15 @@ class HttpOps:
 
     def fetch_data(self, url, qret=False):
         self._mark("GET", url)
-        return fetch_data(url, self.token, qret=qret)
+        return fetch_data(url, token=self.token, qret=qret, auth_provider=self.auth_provider)
 
     def fetch_data_with_headers(self, url):
         self._mark("GET", url)
-        return fetch_data_with_headers(url, self.token)
+        return fetch_data_with_headers(url, token=self.token, auth_provider=self.auth_provider)
 
     def post_data(self, url, payload):
         self._mark("POST", url)
-        return post_data(url, payload, self.token)
+        return post_data(url, payload, token=self.token, auth_provider=self.auth_provider)
 
     def log_perf_summary(self):
         if os.environ.get("SCANNER_PERF_DEBUG") != "1":

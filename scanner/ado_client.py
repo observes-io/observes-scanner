@@ -20,6 +20,7 @@ from scanner.services import (
     ResourcesService,
     StatsService,
     TasksService,
+    UsersService,
 )
 from scanner.services.http_ops import HttpOps
 from scanner.services.runtime import RuntimeIndexes, ScanRuntimeState, ordered_dedupe
@@ -30,13 +31,25 @@ class AzureDevOpsManager:
         self,
         organization,
         project_filter,
-        pat_token,
+        pat_token=None,
         default_build_settings_expectations={},
         branch_limit=5,
         exception_strings=False,
+        auth_provider=None,
+        observes_platform_service=None,
+        skip_sast=False,
     ):
         self.organization = organization
-        self.token = base64.b64encode(f":{pat_token}".encode()).decode()
+        self.skip_sast = skip_sast
+
+        # Use auth_provider if provided, otherwise fall back to PAT encoding
+        self.auth_provider = auth_provider
+        if auth_provider:
+            # For backward compat: store a token string only for PAT mode
+            self.token = auth_provider.token_for_basic_compat if not auth_provider.is_bearer_auth else None
+        else:
+            self.token = base64.b64encode(f":{pat_token}".encode()).decode()
+
         self.default_build_settings_expectations = default_build_settings_expectations or {}
         self.exceptions = exception_strings if exception_strings else [f"/dev.azure.com/{organization}/"]
         self.scan_start_time = datetime.now()
@@ -46,16 +59,17 @@ class AzureDevOpsManager:
 
         self.logger = logging.getLogger("gunicorn.error")
         self.runtime_state = ScanRuntimeState()
-        self.http_ops = HttpOps(token=self.token, runtime_state=self.runtime_state, logger=self.logger)
+        self.http_ops = HttpOps(token=self.token, runtime_state=self.runtime_state, logger=self.logger, auth_provider=self.auth_provider)
 
-        self.projects_service = ProjectsService(manager=self, http_ops=self.http_ops, logger=self.logger)
-        self.pipelines_service = PipelinesService(manager=self, http_ops=self.http_ops, runtime_state=self.runtime_state)
+        self.projects_service = ProjectsService(manager=self, http_ops=self.http_ops, logger=self.logger)   
+        self.pipelines_service = PipelinesService(manager=self, http_ops=self.http_ops, runtime_state=self.runtime_state, observes_platform_service=observes_platform_service, skip_sast=self.skip_sast)
         self.resources_service = ResourcesService(manager=self, http_ops=self.http_ops, logger=self.logger)
         self.repositories_service = RepositoriesService(manager=self, http_ops=self.http_ops, runtime_state=self.runtime_state, logger=self.logger)
         self.artifacts_service = ArtifactsService(manager=self, http_ops=self.http_ops, logger=self.logger)
         self.stats_service = StatsService(manager=self)
         self.tasks_service = TasksService(manager=self, http_ops=self.http_ops)
         self.identities_service = IdentitiesService(manager=self, http_ops=self.http_ops)
+        self.users_service = UsersService(manager=self, http_ops=self.http_ops)
 
         self.projects = self.get_projects(project_filter=project_filter)
 
@@ -186,9 +200,6 @@ class AzureDevOpsManager:
     def get_permissions(self, inventory, all_definitions, builds):
         return self.resources_service.get_permissions(inventory, all_definitions, builds)
 
-    def scan_string_with_regex(self, string, engine, source_of_data):
-        return self.pipelines_service.scan_string_with_regex(string, engine, source_of_data)
-
     def get_project_build_general_settings(self, project):
         return self.projects_service.get_project_build_general_settings(project)
 
@@ -246,3 +257,6 @@ class AzureDevOpsManager:
 
     def get_all_build_service_accounts(self):
         return self.identities_service.get_all_build_service_accounts()
+
+    def discover_users_and_access(self):
+        return self.users_service.discover_users_and_access()

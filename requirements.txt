@@ -4,3 +4,6 @@ pyyaml==6.0.3
 
 # pinning requests sub-dependencies
 urllib3==2.6.3
+
+# Optional: required for service principal / managed identity auth (--auth-mode=service-principal|managed-identity)
+azure-identity>=1.17.0

@@ -14,9 +14,12 @@ from datetime import datetime
 from pathlib import Path
 
 from scanner.ado_client import AzureDevOpsManager
+from scanner.auth import AuthProvider
 from scanner.output import write_scan_result
 from scanner.html_report import write_html_report
-from scanner.services.identity_resolution import IdentityResolutionService
+from scanner.services.azuredevops.identity_resolution import IdentityResolutionService
+from scanner.services.azuredevops.users import normalise_user_references
+from scanner.services.observes_platform_service import ObservesPlatformService
 from scanner.filters import filter_builds, filter_definitions, filter_protected_resources
 
 logger = logging.getLogger(__name__)
@@ -73,7 +76,14 @@ def setup_logging(job_id: str, results_dir: str = None):
     return str(log_file)
 
 
-def build_starter_inventory():
+def build_starter_inventory(observes_platform_service: ObservesPlatformService = None):
+    platform_config = None
+    if observes_platform_service:
+        platform_config = observes_platform_service.get_inventory_config()
+
+    if platform_config:
+        return platform_config
+
     return {
         "endpoint": {
             "api_endpoint": "serviceendpoint/endpoints",
@@ -124,7 +134,14 @@ def build_starter_inventory():
     }
 
 
-def default_build_settings_expectations():
+def default_build_settings_expectations(observes_platform_service: ObservesPlatformService = None):
+    platform_config = None
+    if observes_platform_service:
+        platform_config = observes_platform_service.get_build_settings_expectations()
+
+    if platform_config:
+        return platform_config
+
     return {
         "enforceReferencedRepoScopedToken": True,
         "disableClassicPipelineCreation": True,
@@ -149,9 +166,17 @@ def default_build_settings_expectations():
 
 
 def run_scan(config, scanner_version: str):
+    # @TODO: Add other platforms - only Azure DevOps is implemented so far
+    platform = getattr(config, 'target_platform', 'azure_devops')
+    if platform != 'azure_devops':
+        raise NotImplementedError(
+            f"Scanner for platform '{platform}' is not yet implemented. "
+            "Currently only 'azure_devops' is supported."
+        )
+
     organization = config.organization
     job_id = config.job_id
-    pat_token = config.pat_token
+    auth_mode = getattr(config, 'auth_mode', 'default')
     projects = config.projects or []
     results_dir = config.results_dir or os.getcwd()
     top_branches_to_scan = config.top_branches_to_scan
@@ -160,28 +185,52 @@ def run_scan(config, scanner_version: str):
     skip_feeds = getattr(config, 'skip_feeds', False)
     skip_committer_stats = getattr(config, 'skip_committer_stats', False)
     skip_builds = getattr(config, 'skip_builds', False)
+    skip_users = getattr(config, 'skip_users', False)
+    skip_sast = getattr(config, 'skip_sast', False)
 
     if not organization:
         raise ValueError("Organization must be provided")
     if not job_id:
         raise ValueError("Job ID must be provided")
-    if not pat_token:
-        raise ValueError("Personal Access Token (PAT) must be provided")
+
+    # Create auth provider - validates credentials for the chosen auth mode
+    auth_provider = AuthProvider(config)
 
     # Setup logging
     setup_logging(job_id=job_id, results_dir=results_dir)
     
     start_date = datetime.now().isoformat()
     logger.info(f"Starting scan for {organization} (Job ID: {job_id})")
+    logger.info(f"Authentication mode: {auth_mode}")
     logger.debug(f"Configuration: projects={projects}, top_branches={top_branches_to_scan}, "
-                 f"skip_builds={skip_builds}, skip_feeds={skip_feeds}, skip_committer_stats={skip_committer_stats}")
+                 f"skip_builds={skip_builds}, skip_feeds={skip_feeds}, skip_committer_stats={skip_committer_stats}, skip_users={skip_users}, resolve_identities={resolve_identities}, identity_resolution_resolve={identity_resolution_resolve}")
     
+    # Platform service - connects to SaaS platform for config & result upload
+    observes_platform_service = ObservesPlatformService(
+        observes_platform_url=getattr(config, 'observes_platform_url', None),
+        observes_platform_api_key=getattr(config, 'observes_platform_api_key', None),
+    )
+    if observes_platform_service.is_configured:
+        if observes_platform_service.authenticate():
+            logger.info("Observes Platform integration active")
+        else:
+            logger.warning("Observes Platform configured but authentication failed - using local defaults")
+    else:
+        logger.debug("Observes Platform integration not configured - using local defaults")
+
     az_manager = AzureDevOpsManager(
         organization=organization,
         project_filter=projects if projects else [],
-        default_build_settings_expectations=default_build_settings_expectations(),
-        pat_token=pat_token,
+        default_build_settings_expectations=default_build_settings_expectations(observes_platform_service),
+        auth_provider=auth_provider,
+        observes_platform_service=observes_platform_service,
+        skip_sast=skip_sast
     )
+
+    # @TODO
+    # may remove default_build_settings_expectations
+    # may need to do something with the tasks - currently just retrieved and added to the output, but not used in the analysis
+    # clean the data that is in the output
 
     logger.info("Gathering project metrics and tasks...")
     stats = az_manager.get_project_language_metrics(az_manager.projects.values())
@@ -191,11 +240,11 @@ def run_scan(config, scanner_version: str):
     logger.info("Collecting build definitions and builds...")
     definitions, builds = az_manager.get_builds_per_definition_per_project(top_branches_to_scan=top_branches_to_scan, skip_builds=skip_builds)
     logger.debug(f"Found {len(definitions)} definitions and {len(builds)} builds")
-    
+
     definitions = az_manager.get_build_definition_authorised_resources(definitions)
     
     logger.info("Scanning protected resources...")
-    protected_resources_inventory_resources = az_manager.get_protected_resources(build_starter_inventory())
+    protected_resources_inventory_resources = az_manager.get_protected_resources(build_starter_inventory(observes_platform_service))
     builds = az_manager.resources_service.attach_used_service_connections_to_builds(
         builds,
         protected_resources_inventory_resources.get("endpoint", {}).get("protected_resources", [])
@@ -243,6 +292,18 @@ def run_scan(config, scanner_version: str):
         logger.debug(f"Found {len(artifacts.get('active', []))} active feeds, "
                      f"{len(artifacts.get('recyclebin', []))} in recycle bin")
     
+    # Users, RBAC, and PAT token discovery
+    if skip_users:
+        logger.info("Skipping users, RBAC, and PAT token discovery")
+        users_and_access = {"users": {}, "groups": {}}
+    else:
+        logger.info("Discovering users, RBAC, and PAT tokens...")
+        users_and_access = az_manager.discover_users_and_access()
+        logger.info(
+            f"Discovered {len(users_and_access['users'])} users, "
+            f"{len(users_and_access['groups'])} groups"
+        )
+
     logger.info("Enriching statistics...")
     stats = az_manager.get_enriched_stats(
         stats, protected_resources_inventory_resources_checks_definitions, definitions, builds, commits, artifacts
@@ -273,11 +334,11 @@ def run_scan(config, scanner_version: str):
 
     # Filter builds
     logger.info("Applying filters to scan results...")
-    filtered_builds = filter_builds(builds)
+    filtered_builds = filter_builds(builds, organization=organization)
     logger.debug(f"Filtered builds: {len(builds)} -> {len(filtered_builds)}")
 
     # Filter build definitions
-    filtered_definitions = filter_definitions(definitions)
+    filtered_definitions = filter_definitions(definitions, organization=organization)
     logger.debug(f"Filtered definitions: {len(definitions)} -> {len(filtered_definitions)}")
 
     # Filter protected resources for each type
@@ -285,9 +346,19 @@ def run_scan(config, scanner_version: str):
     for res_type, res_data in protected_resources_inventory_resources_checks_definitions.items():
         if "protected_resources" in res_data and isinstance(res_data["protected_resources"], list):
             original_count = len(res_data["protected_resources"])
-            res_data["protected_resources"] = filter_protected_resources(res_data["protected_resources"])
+            res_data["protected_resources"] = filter_protected_resources(res_data["protected_resources"], organization=organization)
             logger.debug(f"Filtered {res_type}: {original_count} -> {len(res_data['protected_resources'])} resources")
         filtered_protected_resources[res_type] = res_data
+
+    # # SAST scan: scan each unique PIR snapshot once
+    if skip_sast:
+        logger.info("Skipping CICD SAST scan (--skip-sast)")
+    else:
+        logger.info("Running CICD SAST scan on PIR snapshots...")
+        # sast_service = az_manager.pipelines_service.sast_service
+        # sast_service.scan_pir_snapshots(az_manager.pipelines_service.pir_registry)
+        # sast_summary = sast_service.summary()
+        # logger.info(f"SAST: {sast_summary['total_findings']} findings across {sast_summary['snapshots_scanned']} snapshots")
 
     result = {
         "scanner_version": scanner_version,
@@ -324,6 +395,8 @@ def run_scan(config, scanner_version: str):
                 "artifacts_packages": sum(len(feed.get("packages", [])) for feed in artifacts.get("active", []))
                 if "active" in artifacts
                 else 0,
+                "users": len(users_and_access["users"]),
+                "groups": len(users_and_access["groups"]),
             },
         },
         "stats": stats,
@@ -336,6 +409,8 @@ def run_scan(config, scanner_version: str):
         "committer_stats": committer_stats,
         "build_service_accounts": build_service_accounts,
         "artifacts": artifacts,
+        "users": users_and_access["users"],
+        "groups": users_and_access["groups"],
     }
 
     # Optional: Resolve cloud identities for service connections, variable groups, secure files
@@ -354,6 +429,14 @@ def run_scan(config, scanner_version: str):
         else:
             logger.warning("Identity resolution not available (laughing-lamp not installed)")
 
+    # Normalise inline user references (createdBy, authoredBy, etc.) to k_id pointers
+    if not skip_users:
+        logger.info("Normalising user references to k_id pointers...")
+        normalise_user_references(result.get("protected_resources", {}))
+        normalise_user_references(result.get("build_definitions", []))
+        normalise_user_references(result.get("builds", []))
+        normalise_user_references(result.get("commits", []))
+
     logger.info("Writing scan results...")
     output_path = write_scan_result(result, results_dir=results_dir, job_id=job_id)
     html_report_path = write_html_report(result, results_dir=results_dir, job_id=job_id, config=config)
@@ -362,6 +445,14 @@ def run_scan(config, scanner_version: str):
     
     if hasattr(az_manager, "log_perf_summary"):
         az_manager.log_perf_summary()
+
+    # Upload results to SaaS platform (if configured and authenticated)
+    if observes_platform_service.is_configured:
+        logger.info("Uploading scan results to platform...")
+        if observes_platform_service.upload_results(result, job_id):
+            logger.info("Results uploaded to platform successfully")
+        else:
+            logger.warning("Failed to upload results to platform - local results are still available")
     
     logger.info(f"Scan complete. Report: {html_report_path}")
     return result, output_path

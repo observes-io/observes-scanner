@@ -8,6 +8,107 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 from collections import defaultdict
 
+
+def _contains_any(text: str, terms) -> bool:
+    lowered = (text or "").lower()
+    return any(term in lowered for term in terms)
+
+
+def _is_admin_group(group: Dict[str, Any]) -> bool:
+    group_text = " ".join([
+        group.get("displayName", ""),
+        group.get("principalName", ""),
+        group.get("description", ""),
+    ]).lower()
+    return _contains_any(group_text, [
+        "admin",
+        "administrator",
+        "project collection administrators",
+    ])
+
+
+def _classify_pat_scope(scope: str) -> str:
+    scope_text = (scope or "").lower()
+
+    very_high_terms = [
+        "app_token",
+    ]
+
+    high_terms = [
+        "vso.tokens",
+        "vso.tokenadministration",
+        "vso.pats",
+        "vso.entitlements_manage",
+        "vso.governance",
+        "vso.security_manage",
+        "vso.identity_manage",
+        "vso.code_full",
+        "vso.project_manage",
+        "vso.build_execute",
+    ]
+
+    if _contains_any(scope_text, very_high_terms):
+        return "very_high"
+
+    if _contains_any(scope_text, high_terms):
+        return "high"
+
+    return "normal"
+
+
+def _build_iam_rbac_summary(result: Dict[str, Any]) -> Dict[str, int]:
+    users = result.get("users", {}) or {}
+    groups = result.get("groups", {}) or {}
+
+    users_list = list(users.values())
+    groups_list = list(groups.values())
+
+    total_users = len(users_list)
+    aad_users = sum(1 for user in users_list if (user.get("origin") or "").lower() == "aad")
+    service_users = max(total_users - aad_users, 0)
+
+    total_groups = len(groups_list)
+    admin_groups = sum(1 for group in groups_list if _is_admin_group(group))
+
+    total_pats = 0
+    active_pats = 0
+    expired_pats = 0
+    high_privileged_pats = 0
+    very_high_privileged_pats = 0
+    high_privilege_user_ids = set()
+
+    for user_id, user in users.items():
+        for token in user.get("patTokens", []) or []:
+            total_pats += 1
+            is_active = token.get("isValid") is True
+            if is_active:
+                active_pats += 1
+            else:
+                expired_pats += 1
+
+            privilege = _classify_pat_scope(token.get("scope", ""))
+            if is_active and privilege in ("high", "very_high"):
+                high_privilege_user_ids.add(user_id)
+
+            if is_active and privilege == "high":
+                high_privileged_pats += 1
+            if is_active and privilege == "very_high":
+                very_high_privileged_pats += 1
+
+    return {
+        "total_users": total_users,
+        "aad_users": aad_users,
+        "service_users": service_users,
+        "total_groups": total_groups,
+        "admin_groups": admin_groups,
+        "total_pats": total_pats,
+        "active_pats": active_pats,
+        "expired_pats": expired_pats,
+        "high_privilege_users": len(high_privilege_user_ids),
+        "high_privileged_pats": high_privileged_pats,
+        "very_high_privileged_pats": very_high_privileged_pats,
+    }
+
 def write_html_report(result: Dict[str, Any], results_dir: str, job_id: str, config=None) -> str:
     """
     Generate a clean, filterable HTML report from scan results.
@@ -25,6 +126,7 @@ def write_html_report(result: Dict[str, Any], results_dir: str, job_id: str, con
     project_refs = org.get("projectRefs", [])
     stats = result.get("stats", {})
     builds = result.get("builds", [])
+    iam_rbac = _build_iam_rbac_summary(result)
     
     # Create project name lookup
     project_names = {proj["id"]: proj["name"] for proj in project_refs}
@@ -315,6 +417,54 @@ def write_html_report(result: Dict[str, Any], results_dir: str, job_id: str, con
             border-top: 1px solid #dee2e6;
             font-size: 12px;
         }}
+
+        .summary-cards {{
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 12px;
+            margin-bottom: 14px;
+        }}
+
+        .summary-card {{
+            border: 1px solid #dee2e6;
+            border-left: 3px solid #17a2b8;
+            background: #f8f9fa;
+            padding: 14px;
+        }}
+
+        .summary-card .summary-value {{
+            font-size: 26px;
+            font-weight: 700;
+            color: #212529;
+            line-height: 1.1;
+        }}
+
+        .summary-card .summary-label {{
+            margin-top: 6px;
+            font-size: 13px;
+            color: #495057;
+            font-weight: 600;
+        }}
+
+        .summary-card .summary-sub {{
+            margin-top: 4px;
+            color: #6c757d;
+            font-size: 12px;
+        }}
+
+        .alert-note {{
+            margin-top: 10px;
+            border: 1px solid #f5c6cb;
+            background: #fff5f6;
+            color: #721c24;
+            padding: 10px 12px;
+            font-size: 13px;
+        }}
+
+        .alert-note.very-high {{
+            border-color: #f1b0b7;
+            background: #fff0f1;
+        }}
     </style>
 </head>
 <body>
@@ -406,6 +556,64 @@ def write_html_report(result: Dict[str, Any], results_dir: str, job_id: str, con
                     </table>
                 </div>
                 
+                <!-- IAM & RBAC Tracker -->
+                <div class="section">
+                    <h2 class="section-title">PAT Tokens IAM & RBAC Tracker</h2>
+                    <p style="margin-bottom: 12px; color: #6c757d;">Users, groups, and PAT tokens for the organisation</p>
+                    <div class="summary-cards">
+    """
+
+    html += "                        <div class=\"summary-card\">\n"
+    html += f"                            <div class=\"summary-value\">{iam_rbac['total_users']}</div>\n"
+    html += "                            <div class=\"summary-label\">Users</div>\n"
+    html += f"                            <div class=\"summary-sub\">({iam_rbac['aad_users']} AAD, {iam_rbac['service_users']} service)</div>\n"
+    html += "                        </div>\n"
+
+    html += "                        <div class=\"summary-card\">\n"
+    html += f"                            <div class=\"summary-value\">{iam_rbac['total_groups']}</div>\n"
+    html += "                            <div class=\"summary-label\">Groups</div>\n"
+    html += f"                            <div class=\"summary-sub\">({iam_rbac['admin_groups']} admin)</div>\n"
+    html += "                        </div>\n"
+
+    html += "                        <div class=\"summary-card\">\n"
+    html += f"                            <div class=\"summary-value\">{iam_rbac['total_pats']}</div>\n"
+    html += "                            <div class=\"summary-label\">PATs</div>\n"
+    html += f"                            <div class=\"summary-sub\">({iam_rbac['active_pats']} active, {iam_rbac['expired_pats']} expired)</div>\n"
+    html += "                        </div>\n"
+
+    html += "                        <div class=\"summary-card\">\n"
+    html += f"                            <div class=\"summary-value\">{iam_rbac['high_privilege_users']}</div>\n"
+    html += "                            <div class=\"summary-label\">High-privilege users</div>\n"
+    html += (
+        f"                            <div class=\"summary-sub\">"
+        f"({iam_rbac['high_privileged_pats']} elevated PATs, "
+        f"{iam_rbac['very_high_privileged_pats']} very high-privilege PATs)"
+        "</div>"
+    )
+    html += "                        </div>\n"
+
+    html += """                    </div>
+    """
+
+    if iam_rbac['high_privileged_pats'] > 0:
+        html += (
+            f"                    <div class=\"alert-note\">"
+            f"{iam_rbac['high_privileged_pats']} active PAT token(s) with high-privilege scopes detected. "
+            "These tokens grant elevated permissions such as security management, identity management, "
+            "or full code access."
+            "</div>\n"
+        )
+
+    if iam_rbac['very_high_privileged_pats'] > 0:
+        html += (
+            f"                    <div class=\"alert-note very-high\">"
+            f"{iam_rbac['very_high_privileged_pats']} active PAT token(s) with very high-privilege scopes detected. "
+            "These tokens grant the highest level of permissions and should be closely monitored."
+            "</div>\n"
+        )
+
+    html += """                </div>
+                
                 <!-- Project Breakdown -->
                 <div class="section">
                     <h2 class="section-title">Project Details</h2>
@@ -417,7 +625,6 @@ def write_html_report(result: Dict[str, Any], results_dir: str, job_id: str, con
                         <thead>
                             <tr>
                                 <th>Project Name</th>
-                                <th>Project ID</th>
                                 <th>Endpoints</th>
                                 <th>Variable Groups</th>
                                 <th>Secure Files</th>
@@ -453,7 +660,6 @@ def write_html_report(result: Dict[str, Any], results_dir: str, job_id: str, con
         
         html += f"""                            <tr>
                                 <td><a href="{project_url}" target="_blank" style="color: #667eea; text-decoration: none; font-weight: 600;">{project_name}</a></td>
-                                <td style="font-size: 0.85rem; color: #718096;">{project_id[:8]}...</td>
                                 <td class="count">{endpoints}</td>
                                 <td class="count">{vargroups}</td>
                                 <td class="count">{securefiles}</td>

@@ -12,96 +12,93 @@ import logging
 import urllib.parse
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import re
 
 import yaml
 
+from scanner.services.runtime import normalize_to_list
+from scanner.services.azuredevops.sast_service import SastService
+from scanner.services.azuredevops.pipeline_parser import AzureDevOpsPipelineParser
+from scanner.services.azuredevops.pipeline_graph.log_parser import EvaluationLogParser
 from scanner.services.runtime import normalize_to_list
 
 logger = logging.getLogger(__name__)
 
 
 class PipelinesService:
-    def __init__(self, manager, http_ops, runtime_state):
+    def __init__(self, manager, http_ops, runtime_state, observes_platform_service=None, skip_sast=False):
         self.manager = manager
         self.http_ops = http_ops
         self.runtime_state = runtime_state
+        self.sast_service = SastService(
+            api_client=observes_platform_service,
+            exceptions=getattr(manager, 'exceptions', []),
+            skip=skip_sast
+        )
 
-    def parse_pipeline_yaml(self, yaml_content):
+    def parse_pipeline_yaml(self, yaml_content, metadata=None):
+        """
+        Returns:
+            dict: Parsed YAML (current) or structured pipeline representation
+        """
         if not yaml_content:
             logger.debug("No YAML content provided")
             return None
+        
         try:
-            return yaml.safe_load(yaml_content)
+            parsed_yaml = yaml.safe_load(yaml_content)
+            return parsed_yaml
+            
         except yaml.YAMLError as e:
             logger.warning(f"Error parsing YAML: {e}")
             return None
 
-    def scan_string_with_regex(self, string, engine, source_of_data):
-        if not self.runtime_state.regex_patterns_loaded:
-            regex_cache = {}
-            try:
-                with open("datastore/scanners/patterns/cicd_sast.json", "r") as file:
-                    patterns_data = json.load(file)
-                    for current_engine, engine_data in patterns_data.items():
-                        compiled_patterns = []
-                        categories = engine_data.get("categories", [])
-                        for category in categories:
-                            category_name = category.get("name", "Unknown")
-                            category_severity = category.get("severity", "unknown")
-                            category_description = category.get("description", "")
-                            for pattern in category.get("patterns", []):
-                                try:
-                                    compiled_pattern = re.compile(pattern)
-                                    compiled_patterns.append({
-                                        "pattern": compiled_pattern,
-                                        "category": category_name,
-                                        "severity": category_severity,
-                                        "description": category_description
-                                    })
-                                except re.error as regex_error:
-                                    logger.warning(f"Invalid regex pattern skipped for engine {current_engine}, category {category_name}: {regex_error}")
-                        regex_cache[current_engine] = compiled_patterns
-            except FileNotFoundError:
-                logger.error("Regex patterns file not found. Please ensure 'patterns/cicd_sast.json' exists.")
-            except json.JSONDecodeError:
-                logger.error("Failed to parse the regex patterns file as JSON.")
-            except Exception as e:
-                logger.error(f"Error loading regex patterns: {e}")
-            self.runtime_state.regex_patterns_cache = regex_cache
-            self.runtime_state.regex_patterns_loaded = True
-
-        compiled_patterns = self.runtime_state.regex_patterns_cache.get(engine, [])
-        if not compiled_patterns:
-            logger.debug(f"No patterns found for engine {engine}")
-            return []
-
-        findings = []
-        for pattern_info in compiled_patterns:
-            compiled_pattern = pattern_info["pattern"]
-            for match in compiled_pattern.finditer(string):
-                should_skip = False
-                for exception in self.manager.exceptions:
-                    if isinstance(match.group(), str) and exception in match.group():
-                        logger.debug(f"Skipping match {match.group()} due to exception")
-                        should_skip = True
-                        break
-                
-                if not should_skip:
-                    findings.append(
-                        {
-                            "source": source_of_data,
-                            "match": match.group(),
-                            "start": match.start(),
-                            "end": match.end(),
-                            "pattern": compiled_pattern.pattern,
-                            "category": pattern_info["category"],
-                            "severity": pattern_info["severity"],
-                            "description": pattern_info["description"]
-                        }
-                    )
-                    logger.debug(f"Found match: {match.group()} at {match.start()}-{match.end()} [Category: {pattern_info['category']}, Severity: {pattern_info['severity']}]")
-        return findings
+    def _build_pipeline_metadata(self, build_definition, project_id, branch_name=None):
+        """
+        Build metadata dict for structured pipeline parsing.
+        
+        Args:
+            build_definition: Build definition dict from API
+            project_id: Project GUID
+            branch_name: Optional branch name for preview context
+        
+        Returns:
+            dict: Metadata for pipeline parser
+        """
+        repository_info = build_definition.get("repository", {})
+        project = self.manager.projects.get(project_id, {})
+        
+        metadata = {
+            "structured": True,  # Enable structured parsing
+            "project_id": project_id,
+            "project_name": project.get("name") if isinstance(project, dict) else project_id,
+            "pipeline_id": str(build_definition.get("id")),
+            "pipeline_name": build_definition.get("name"),
+            "pipeline_url": build_definition.get("_links", {}).get("self", {}).get("href"),
+            "pipeline_type": "yaml" if build_definition.get("process", {}).get("type") == 2 else "designer",
+            "pipeline_status": "enabled" if build_definition.get("queueStatus") != "disabled" else "disabled"
+        }
+        
+        # Add repository info if available
+        if repository_info:
+            metadata["repository"] = {
+                "id": repository_info.get("id"),
+                "type": repository_info.get("type"),
+                "name": repository_info.get("name"),
+                "url": repository_info.get("url"),
+                "ref": repository_info.get("defaultBranch", "refs/heads/main"),
+                "commit": repository_info.get("checkoutSubmodules")  # This might not be right, adjust as needed
+            }
+            
+            # Extract YAML path from process if available
+            process = build_definition.get("process", {})
+            if process.get("yamlFilename"):
+                metadata["yaml_path"] = process.get("yamlFilename")
+        
+        # Add branch context if provided
+        if branch_name:
+            metadata["branch"] = branch_name
+        
+        return metadata
 
     def get_build_definition_metrics(self, build_definition_id):
         project, definition_id = build_definition_id.split("_")
@@ -116,6 +113,15 @@ class PipelinesService:
         except Exception as e:
             logger.warning(f"Error fetching def_metrics for project {project} / pipeline ID {definition_id}: {e}")
             return None
+
+    def _fetch_build_logs(self, build, manager_pipeline):
+        base_url = f"https://dev.azure.com/{self.manager.organization}/{build['project']['id']}/{manager_pipeline['builds']['api_endpoint']}/{build['id']}"
+        api_ver = manager_pipeline['builds']['api_version']
+        yaml_url = f"{base_url}/logs/1?{api_ver}"
+        yaml_content = self.http_ops.fetch_data(yaml_url, qret=True)
+        template_eval = self.http_ops.fetch_data(f"{base_url}/logs/2?{api_ver}", qret=True)
+        timeline = self.http_ops.fetch_data(f"{base_url}/Timeline?{api_ver}")
+        return build["id"], yaml_content, yaml_url, template_eval, timeline
 
     def _process_build_definition(self, project, build_definition, project_name_to_id, manager_pipeline, top_branches_to_scan, skip_builds=False):
         
@@ -148,40 +154,73 @@ class PipelinesService:
                 build["k_project"] = self.manager.enrich_k_project(project)
                 build["k_key"] = f"{project}_{build.get('id')}"
 
-            def _fetch_yaml(build):
-                yaml_url = f"https://dev.azure.com/{self.manager.organization}/{project}/{manager_pipeline['builds']['api_endpoint']}/{build['id']}/logs/1?{manager_pipeline['builds']['api_version']}"
-                yaml_content = self.http_ops.fetch_data(yaml_url, qret=True)
-                return build["id"], yaml_content
-
             yaml_results = {}
+            template_eval_results = {}
+            timeline_results = {}
             with ThreadPoolExecutor(max_workers=4) as pool:
-                future_map = {pool.submit(_fetch_yaml, build): build["id"] for build in builds}
+                future_map = {pool.submit(self._fetch_build_logs, build, manager_pipeline): str(build.get("id", idx)) for idx, build in enumerate(builds)}
+                yaml_url_results = {}
                 for future in as_completed(future_map):
+                    build_key = future_map[future]
                     try:
-                        build_id, yaml_content = future.result()
+                        build_id, yaml_content, yaml_url, template_eval, timeline = future.result()
                         yaml_results[build_id] = yaml_content
+                        yaml_url_results[build_id] = yaml_url
+                        template_eval_results[build_id] = template_eval
+                        timeline_results[build_id] = timeline
                     except Exception as err:
-                        logger.warning(f"Could not get YAML for build {future_map[future]}: {err}")
-                        yaml_results[future_map[future]] = None
+                        logger.warning(f"Could not get YAML for build {build_key}: {err}")
+                        yaml_results[build_key] = None
+                        yaml_url_results[build_key] = None
+                        template_eval_results[build_key] = None
+                        timeline_results[build_key] = None
 
             processed_builds = []
+            eval_log_parser = EvaluationLogParser()
             for build in builds:
                 logger.debug(f"Processing build {build.get('id')} for definition {build_definition.get('name')}")
                 yaml_content = yaml_results.get(build.get("id"))
+                template_eval_raw = template_eval_results.get(build.get("id"))
+                build["cicd_sast"] = []
                 try:
-                    pipeline_recipe = self.parse_pipeline_yaml(yaml_content)
+                    # Structured parsing of the rendered YAML (logs/1)
+                    metadata = self._build_pipeline_metadata(enriched_build_definition, project)
+                    pipeline_recipe = self.parse_pipeline_yaml(yaml_content, metadata=metadata)
+
+                    # Parse template evaluation log (logs/2) and enrich the
+                    # structured pipeline_recipe with condition evaluations
+                    if template_eval_raw and pipeline_recipe and isinstance(pipeline_recipe, dict):
+                        eval_summary = eval_log_parser.parse(template_eval_raw)
+                        parser = AzureDevOpsPipelineParser(organization=self.manager.organization)
+                        pipeline_recipe = parser.enrich_with_template_evaluation(pipeline_recipe, eval_summary)
+
+                    # Enrich with timeline execution status and templateParameters
+                    timeline_data = timeline_results.get(build.get("id"))
+                    template_params = build.get("templateParameters")
+                    if isinstance(template_params, str):
+                        try:
+                            template_params = json.loads(template_params)
+                        except Exception:
+                            template_params = {}
+
+                    # No OP
+                    # if pipeline_recipe and isinstance(pipeline_recipe, dict):
+                    #     parser = AzureDevOpsPipelineParser(organization=self.manager.organization)
+                    #     pipeline_recipe = parser.enrich_with_timeline(pipeline_recipe, timeline_data, template_params)
+                    #     if pipeline_recipe.get("snapshotId"):
+                    #         pipeline_recipe = AzureDevOpsPipelineParser.finalize_recipe(pipeline_recipe, self.pir_registry, yaml_content=yaml_content)
+
                     build["pipeline_recipe"] = pipeline_recipe
                     if yaml_content is not None:
-                        build["yaml"] = yaml_content
-                        source_url = build.get("_links", {}).get("self", {}).get("href", "")
-                        regex_results = self.scan_string_with_regex(yaml_content, "regex", source_url)
-                        build.setdefault("cicd_sast", [])
-                        if regex_results:
-                            build["cicd_sast"].append({"engine": "regex", "scope": "pipeline_yaml", "results": regex_results})
+                        build["yaml_url"] = yaml_url_results.get(build.get("id"))
+                        if not self.sast_service._skip:
+                            regex_results = self.sast_service._scan_content(yaml_content, snapshot_id=build["k_key"], engine="regex")
+                            if regex_results:
+                                build["cicd_sast"].append({"engine": "regex", "scope": "pipeline_yaml", "results": regex_results})
                         enriched_build_definition["builds"]["builds"].append(str(build.get("id")))
                     processed_builds.append(build)
-                except Exception:
-                    logger.warning(f"Could not parse YAML for build {build.get('id')} for build definition {build_definition.get('name')}")
+                except Exception as err:
+                    logger.warning(f"Could not parse YAML for build {build.get('id')} for build definition {build_definition.get('name')}: {err}")
                     continue
 
             if manager_pipeline.get("preview"):
@@ -220,10 +259,10 @@ class PipelinesService:
                         )
 
                     def _preview_one_branch(branch_name):
-                        branch_result = {"is_yaml_preview_available": False, "cicd_sast": []}
+                        branch_result = {"is_yaml_preview_available": False, "cicd_sast": [], "yaml_url": None, "pipeline_recipe": None}
 
                         if build_definition.get("queueStatus") == "disabled":
-                            branch_result["yaml"] = "Build Definition is disabled"
+                            branch_result["yaml_url"] = None
                             branch_result["pipeline_recipe"] = "Build Definition is disabled"
                             return branch_name, branch_result
 
@@ -267,9 +306,9 @@ class PipelinesService:
                                     }
                             preview, error_message = self.http_ops.post_data(preview_url, json.dumps(payload_obj))
 
+                        yaml_url = f"https://dev.azure.com/{self.manager.organization}/{project}/{manager_pipeline['build_definitions']['api_endpoint']}/{enriched_build_definition['id']}/yaml?{manager_pipeline['build_definitions']['api_version']}"
                         if preview is not None:
                             if preview == {}:
-                                yaml_url = f"https://dev.azure.com/{self.manager.organization}/{project}/{manager_pipeline['build_definitions']['api_endpoint']}/{enriched_build_definition['id']}/yaml?{manager_pipeline['build_definitions']['api_version']}"
                                 yaml_preview = self.http_ops.fetch_data(yaml_url, qret=True)
                                 try:
                                     should_parse_yaml = isinstance(yaml_preview, str) or (
@@ -279,46 +318,37 @@ class PipelinesService:
                                     if should_parse_yaml and yaml_preview:
                                         yaml_preview_json = json.loads(yaml_preview) if isinstance(yaml_preview, str) else yaml_preview
                                         yaml_content = yaml_preview_json.get("yaml", "")
-                                        branch_result["yaml"] = yaml_content
+                                        branch_result["yaml_url"] = yaml_url
                                         branch_result["pipeline_recipe"] = self.parse_pipeline_yaml(yaml_content)
-                                        regex_results = self.scan_string_with_regex(
-                                            yaml_preview if isinstance(yaml_preview, str) else json.dumps(yaml_preview),
-                                            "regex",
-                                            f"{branch_name} @ {enriched_build_definition.get('_links', {}).get('self', {}).get('href', '')}",
-                                        )
-                                        branch_result["cicd_sast"].append(
-                                            {
-                                                "engine": "regex",
-                                                "scope": "potential_pipeline_execution_yaml",
-                                                "results": regex_results,
-                                            }
-                                        )
+                                        if not self.sast_service._skip:
+                                            regex_results = self.sast_service._scan_content(yaml_content, snapshot_id=branch_name, engine="regex")
+                                            if regex_results:
+                                                branch_result["cicd_sast"].append({"engine": "regex", "scope": "pipeline_yaml", "results": regex_results})
+
                                         branch_result["is_yaml_preview_available"] = True
                                     else:
-                                        branch_result["yaml"] = "Empty YAML PREVIEW"
+                                        branch_result["yaml_url"] = yaml_url
                                         branch_result["pipeline_recipe"] = self.parse_pipeline_yaml(preview)
                                 except Exception as err:
-                                    branch_result["yaml"] = f"Could not parse YAML PREVIEW - {err}"
-                                    branch_result["pipeline_recipe"] = None
+                                    branch_result["yaml_url"] = yaml_url
                             else:
-                                branch_result["yaml"] = preview.get("finalYaml")
-                                branch_result["pipeline_recipe"] = self.parse_pipeline_yaml(preview.get("finalYaml"))
+                                branch_result["yaml_url"] = yaml_url
+                                # To enable structured parsing for preview:
+                                metadata = self._build_pipeline_metadata(enriched_build_definition, project, branch_name)
+                                final_yaml = preview.get("finalYaml")
+                                preview_recipe = self.parse_pipeline_yaml(final_yaml, metadata=metadata)
+                                # if preview_recipe and isinstance(preview_recipe, dict) and preview_recipe.get("snapshotId"):
+                                #     preview_recipe = AzureDevOpsPipelineParser.finalize_recipe(preview_recipe, self.pir_registry, yaml_content=final_yaml)
+                                if not self.sast_service._skip:
+                                    regex_results = self.sast_service._scan_content(final_yaml, snapshot_id=branch_name, engine="regex")
+                                    if regex_results:
+                                        branch_result["cicd_sast"].append({"engine": "regex", "scope": "pipeline_yaml", "results": regex_results})
+                                
+                                branch_result["pipeline_recipe"] = preview_recipe
                                 branch_result["is_yaml_preview_available"] = True
-                                regex_results = self.scan_string_with_regex(
-                                    preview.get("finalYaml", ""),
-                                    "regex",
-                                    f"{branch_name} @ {enriched_build_definition.get('_links', {}).get('self', {}).get('href', '')}",
-                                )
-                                branch_result["cicd_sast"].append(
-                                    {
-                                        "engine": "regex",
-                                        "scope": "potential_pipeline_execution_yaml",
-                                        "results": regex_results,
-                                    }
-                                )
+   
                         else:
-                            branch_result["yaml"] = f"Could not get YAML PREVIEW - {error_message}"
-                            branch_result["cicd_sast"] = []
+                            branch_result["yaml_url"] = yaml_url
                             branch_result["is_yaml_preview_available"] = False
                         return branch_name, branch_result
 
@@ -331,7 +361,7 @@ class PipelinesService:
                     for branch_name in branches_names:
                         enriched_build_definition["builds"]["preview"][branch_name] = preview_results.get(
                             branch_name,
-                            {"is_yaml_preview_available": False, "yaml": "No preview", "pipeline_recipe": None, "cicd_sast": []},
+                            {"is_yaml_preview_available": False, "yaml_url": None, "pipeline_recipe": None},
                         )
 
         return enriched_build_definition, processed_builds

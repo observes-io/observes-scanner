@@ -7,14 +7,15 @@
 # Internal use only; additional clarifications in LICENSE-CLARIFICATIONS.md
 ####
 
-from scanner.services.artifacts import ArtifactsService
-from scanner.services.identities import IdentitiesService
-from scanner.services.pipelines import PipelinesService
-from scanner.services.projects import ProjectsService
-from scanner.services.repositories import RepositoriesService
-from scanner.services.resources import ResourcesService
-from scanner.services.stats import StatsService
-from scanner.services.tasks import TasksService
+from scanner.services.azuredevops.artifacts import ArtifactsService
+from scanner.services.azuredevops.identities import IdentitiesService
+from scanner.services.azuredevops.pipelines import PipelinesService
+from scanner.services.azuredevops.projects import ProjectsService
+from scanner.services.azuredevops.repositories import RepositoriesService
+from scanner.services.azuredevops.resources import ResourcesService
+from scanner.services.azuredevops.stats import StatsService
+from scanner.services.azuredevops.tasks import TasksService
+from scanner.services.azuredevops.users import UsersService
 
 __all__ = [
     "ArtifactsService",
@@ -25,4 +26,5 @@ __all__ = [
     "ResourcesService",
     "StatsService",
     "TasksService",
+    "UsersService",
 ]
